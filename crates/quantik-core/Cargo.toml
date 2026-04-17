@@ -1,0 +1,9 @@
+[package]
+name = "quantik-core"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance Quantik board game engine"
+
+[dependencies]
+rand = "0.8"
+rusqlite = { version = "0.31", features = ["bundled"] }
