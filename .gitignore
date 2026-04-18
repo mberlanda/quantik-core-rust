@@ -4,3 +4,4 @@ Cargo.lock
 *.db-journal
 *.db-wal
 *.db-shm
+bfs_checkpoints/
