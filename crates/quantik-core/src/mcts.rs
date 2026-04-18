@@ -1,5 +1,5 @@
 use crate::bitboard::Bitboard;
-use crate::game::{check_winner, WinStatus};
+use crate::game::{check_winner, current_player, WinStatus};
 use crate::moves::{apply_move, generate_legal_moves, Move};
 use rand::prelude::*;
 
@@ -148,6 +148,10 @@ impl MCTSEngine {
         let terminal_value = match terminal {
             WinStatus::Player0Wins => 1.0,
             WinStatus::Player1Wins => -1.0,
+            WinStatus::NoWin if legal.is_empty() => {
+                // No legal moves: the player who cannot move loses
+                if current_player(&new_bb) == Some(0) { -1.0 } else { 1.0 }
+            }
             WinStatus::NoWin => 0.0,
         };
 
@@ -192,7 +196,8 @@ impl MCTSEngine {
             }
             let moves = generate_legal_moves(&current_bb);
             if moves.is_empty() {
-                return 0.0;
+                // No legal moves: the player who cannot move loses
+                return if current_player(&current_bb) == Some(0) { -1.0 } else { 1.0 };
             }
             let mv = moves[self.rng.gen_range(0..moves.len())];
             current_bb = apply_move(&current_bb, &mv);
