@@ -5,24 +5,23 @@ use quantik_core::game::{current_player, has_winning_line};
 use quantik_core::moves::{apply_move, generate_legal_moves, Move};
 use quantik_core::symmetry::SymmetryHandler;
 use rusqlite::{params, Connection};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "bench_bfs", about = "Quantik BFS/DFS position enumerator with SQLite storage")]
+#[command(
+    name = "bench_bfs",
+    about = "Quantik IDDFS opening-book builder with SQLite transposition table"
+)]
 struct Cli {
     /// Maximum depth to explore
     depth: usize,
 
     /// SQLite database path
-    #[arg(long, default_value = "quantik_bfs.db")]
+    #[arg(long, default_value = "quantik_book.db")]
     db: String,
 
-    /// Use iterative-deepening DFS instead of BFS
-    #[arg(long)]
-    dfs: bool,
-
-    /// Resume from existing database
+    /// Resume from existing database (uses searched_depth for transposition)
     #[arg(long)]
     resume: bool,
 
@@ -30,12 +29,18 @@ struct Cli {
     #[arg(long)]
     max_positions: Option<usize>,
 
+    /// Depth for exhaustive IDDFS expansion (default: same as depth)
+    #[arg(long)]
+    exhaustive_depth: Option<usize>,
+
+    /// SQLite transaction batch size
+    #[arg(long, default_value = "50000")]
+    batch_size: usize,
+
     /// Only print summary
     #[arg(long)]
     quiet: bool,
 }
-
-const PROGRESS_INTERVAL: usize = 10_000;
 
 fn canonical_key(bb: &Bitboard) -> [u8; 18] {
     let canon = SymmetryHandler::find_canonical(bb);
@@ -44,12 +49,6 @@ fn canonical_key(bb: &Bitboard) -> [u8; 18] {
     key[1] = FLAG_CANON;
     key[2..18].copy_from_slice(&canon.to_le_bytes());
     key
-}
-
-fn key_to_bb(key: &[u8]) -> Bitboard {
-    let mut buf = [0u8; 16];
-    buf.copy_from_slice(&key[2..18]);
-    Bitboard::from_le_bytes(&buf)
 }
 
 fn move_to_string(m: &Move) -> String {
@@ -64,8 +63,7 @@ fn determine_winner(bb: &Bitboard) -> Option<u8> {
     } else {
         let moves = generate_legal_moves(bb);
         if moves.is_empty() {
-            current_player(bb)
-                .map(|loser| 1 - loser)
+            current_player(bb).map(|loser| 1 - loser)
         } else {
             None
         }
@@ -76,151 +74,265 @@ fn is_terminal(bb: &Bitboard) -> bool {
     has_winning_line(bb) || generate_legal_moves(bb).is_empty()
 }
 
-// ── Database ─────────────────────────────────────────────────────────
+// ── In-memory position cache ────────────────────────────────────────
 
-struct BfsDb {
-    conn: Connection,
+struct PositionEntry {
+    depth: usize,
+    searched_depth: usize,
+    is_terminal: bool,
+    dirty: bool,
 }
 
-impl BfsDb {
-    fn open(path: &str) -> Self {
+struct BookBuilder {
+    conn: Connection,
+    cache: HashMap<[u8; 18], PositionEntry>,
+    edge_buffer: Vec<([u8; 18], [u8; 18], String)>,
+    new_positions: Vec<([u8; 18], usize, bool, Option<u8>, usize)>,
+    pending_searched_updates: Vec<([u8; 18], usize)>,
+    pending_status_updates: Vec<[u8; 18]>,
+    batch_size: usize,
+    ops_since_commit: usize,
+    total_edges_inserted: usize,
+}
+
+impl BookBuilder {
+    fn open(path: &str, batch_size: usize) -> Self {
         let conn = Connection::open(path).expect("Failed to open database");
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
-             PRAGMA cache_size = -102400;",
+             PRAGMA cache_size = -204800;
+             PRAGMA temp_store = MEMORY;",
         )
         .expect("Failed to set pragmas");
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS positions (
                 canonical_key BLOB PRIMARY KEY,
-                parent_key BLOB,
-                parent_move TEXT,
                 depth INTEGER NOT NULL,
                 is_terminal INTEGER NOT NULL DEFAULT 0,
                 winner INTEGER,
                 symmetry_count INTEGER NOT NULL,
+                searched_depth INTEGER NOT NULL DEFAULT 0,
+                score REAL,
                 status INTEGER NOT NULL DEFAULT 0
             );
-            CREATE INDEX IF NOT EXISTS idx_depth ON positions(depth);
-            CREATE INDEX IF NOT EXISTS idx_status ON positions(status);",
+            CREATE TABLE IF NOT EXISTS edges (
+                parent_key BLOB NOT NULL,
+                child_key BLOB NOT NULL,
+                move TEXT NOT NULL,
+                PRIMARY KEY (parent_key, child_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_edges_child ON edges(child_key);
+            CREATE INDEX IF NOT EXISTS idx_pos_depth ON positions(depth);
+            CREATE INDEX IF NOT EXISTS idx_pos_status ON positions(status);
+            CREATE INDEX IF NOT EXISTS idx_pos_searched ON positions(searched_depth);",
         )
         .expect("Failed to create schema");
 
-        Self { conn }
+        Self {
+            conn,
+            cache: HashMap::new(),
+            edge_buffer: Vec::new(),
+            new_positions: Vec::new(),
+            pending_searched_updates: Vec::new(),
+            pending_status_updates: Vec::new(),
+            batch_size,
+            ops_since_commit: 0,
+            total_edges_inserted: 0,
+        }
     }
 
-    fn insert_position(
-        &self,
-        key: &[u8; 18],
-        parent_key: Option<&[u8; 18]>,
-        parent_move: Option<&str>,
-        depth: usize,
-        terminal: bool,
-        winner: Option<u8>,
-        symmetry_count: usize,
-        status: i32,
-    ) {
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO positions
-                 (canonical_key, parent_key, parent_move, depth, is_terminal, winner, symmetry_count, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    key.as_slice(),
-                    parent_key.map(|k| k.as_slice()),
-                    parent_move,
-                    depth as i64,
-                    terminal as i32,
-                    winner.map(|w| w as i32),
-                    symmetry_count as i64,
-                    status,
-                ],
-            )
-            .expect("Failed to insert position");
-    }
-
-    fn mark_expanded(&self, key: &[u8; 18]) {
-        self.conn
-            .execute(
-                "UPDATE positions SET status = 1 WHERE canonical_key = ?1",
-                params![key.as_slice()],
-            )
-            .expect("Failed to mark expanded");
-    }
-
-    fn mark_dropped_frontier(&self) {
-        self.conn
-            .execute("UPDATE positions SET status = 2 WHERE status = 0", [])
-            .expect("Failed to mark dropped");
-    }
-
-    fn restore_dropped_to_frontier(&self) {
-        self.conn
-            .execute("UPDATE positions SET status = 0 WHERE status = 2", [])
-            .expect("Failed to restore dropped");
-    }
-
-    fn load_seen(&self) -> HashSet<[u8; 18]> {
+    fn load_cache_from_db(&mut self) {
         let mut stmt = self
             .conn
-            .prepare("SELECT canonical_key FROM positions")
-            .expect("Failed to prepare seen query");
-        let rows = stmt
-            .query_map([], |row| {
-                let blob: Vec<u8> = row.get(0)?;
-                let mut key = [0u8; 18];
-                key.copy_from_slice(&blob);
-                Ok(key)
-            })
-            .expect("Failed to query seen");
-        rows.filter_map(|r| r.ok()).collect()
-    }
-
-    fn load_frontier(&self) -> Vec<(Bitboard, [u8; 18], usize)> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT canonical_key, depth FROM positions WHERE status IN (0, 2) ORDER BY depth")
-            .expect("Failed to prepare frontier query");
+            .prepare("SELECT canonical_key, depth, searched_depth, is_terminal FROM positions")
+            .expect("Failed to prepare cache load");
         let rows = stmt
             .query_map([], |row| {
                 let blob: Vec<u8> = row.get(0)?;
                 let depth: i64 = row.get(1)?;
+                let searched_depth: i64 = row.get(2)?;
+                let is_terminal: i32 = row.get(3)?;
                 let mut key = [0u8; 18];
                 key.copy_from_slice(&blob);
-                let bb = key_to_bb(&key);
-                Ok((bb, key, depth as usize))
+                Ok((key, depth as usize, searched_depth as usize, is_terminal != 0))
             })
-            .expect("Failed to query frontier");
-        rows.filter_map(|r| r.ok()).collect()
+            .expect("Failed to query cache");
+        for r in rows.flatten() {
+            self.cache.insert(
+                r.0,
+                PositionEntry {
+                    depth: r.1,
+                    searched_depth: r.2,
+                    is_terminal: r.3,
+                    dirty: false,
+                },
+            );
+        }
     }
 
-    fn total_count(&self) -> usize {
-        self.conn
-            .query_row("SELECT COUNT(*) FROM positions", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap_or(0) as usize
+    fn total_edge_count(&self) -> usize {
+        let db_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM edges", [], |row| row.get(0))
+            .unwrap_or(0);
+        db_count as usize
     }
 
-    fn begin_transaction(&self) {
+    fn cache_position(
+        &mut self,
+        key: [u8; 18],
+        depth: usize,
+        terminal: bool,
+        winner: Option<u8>,
+        symmetry_count: usize,
+    ) -> bool {
+        if let Some(entry) = self.cache.get_mut(&key) {
+            if depth < entry.depth {
+                entry.depth = depth;
+                entry.dirty = true;
+            }
+            return false;
+        }
+        self.cache.insert(
+            key,
+            PositionEntry {
+                depth,
+                searched_depth: 0,
+                is_terminal: terminal,
+                dirty: false,
+            },
+        );
+        self.new_positions
+            .push((key, depth, terminal, winner, symmetry_count));
+        self.ops_since_commit += 1;
+        true
+    }
+
+    fn cache_edge(&mut self, parent: [u8; 18], child: [u8; 18], move_str: String) {
+        self.edge_buffer.push((parent, child, move_str));
+        self.ops_since_commit += 1;
+    }
+
+    fn update_searched_depth(&mut self, key: &[u8; 18], new_searched: usize) {
+        if let Some(entry) = self.cache.get_mut(key) {
+            if new_searched > entry.searched_depth {
+                entry.searched_depth = new_searched;
+                self.pending_searched_updates.push((*key, new_searched));
+                self.ops_since_commit += 1;
+            }
+        }
+    }
+
+    fn mark_expanded(&mut self, key: &[u8; 18]) {
+        self.pending_status_updates.push(*key);
+        self.ops_since_commit += 1;
+    }
+
+    fn should_flush(&self) -> bool {
+        self.ops_since_commit >= self.batch_size
+    }
+
+    fn flush(&mut self) {
         self.conn
             .execute_batch("BEGIN TRANSACTION")
             .expect("Failed to begin transaction");
-    }
 
-    fn commit_transaction(&self) {
+        {
+            let mut stmt = self
+                .conn
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO positions
+                     (canonical_key, depth, is_terminal, winner, symmetry_count, searched_depth, status)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 0, 0)",
+                )
+                .expect("Failed to prepare position insert");
+            for &(ref key, depth, terminal, winner, sym) in &self.new_positions {
+                stmt.execute(params![
+                    key.as_slice(),
+                    depth as i64,
+                    terminal as i32,
+                    winner.map(|w| w as i32),
+                    sym as i64,
+                ])
+                .expect("Failed to insert position");
+            }
+        }
+
+        {
+            let mut stmt = self
+                .conn
+                .prepare_cached(
+                    "INSERT OR IGNORE INTO edges (parent_key, child_key, move) VALUES (?1, ?2, ?3)",
+                )
+                .expect("Failed to prepare edge insert");
+            for (parent, child, move_str) in &self.edge_buffer {
+                stmt.execute(params![
+                    parent.as_slice(),
+                    child.as_slice(),
+                    move_str.as_str(),
+                ])
+                .expect("Failed to insert edge");
+            }
+            self.total_edges_inserted += self.edge_buffer.len();
+        }
+
+        {
+            let mut stmt = self
+                .conn
+                .prepare_cached(
+                    "UPDATE positions SET searched_depth = MAX(searched_depth, ?2) WHERE canonical_key = ?1",
+                )
+                .expect("Failed to prepare searched_depth update");
+            for (key, sd) in &self.pending_searched_updates {
+                stmt.execute(params![key.as_slice(), *sd as i64])
+                    .expect("Failed to update searched_depth");
+            }
+        }
+
+        {
+            let mut stmt = self
+                .conn
+                .prepare_cached(
+                    "UPDATE positions SET status = 1 WHERE canonical_key = ?1 AND status != 1",
+                )
+                .expect("Failed to prepare status update");
+            for key in &self.pending_status_updates {
+                stmt.execute(params![key.as_slice()])
+                    .expect("Failed to mark expanded");
+            }
+        }
+
         self.conn
             .execute_batch("COMMIT")
             .expect("Failed to commit transaction");
+
+        self.new_positions.clear();
+        self.edge_buffer.clear();
+        self.pending_searched_updates.clear();
+        self.pending_status_updates.clear();
+        self.ops_since_commit = 0;
     }
 
-    fn summary_by_depth(&self) -> Vec<(i64, i64, i64, i64)> {
+    fn position_count(&self) -> usize {
+        self.cache.len()
+    }
+
+    fn searched_depth_for(&self, key: &[u8; 18]) -> usize {
+        self.cache.get(key).map_or(0, |e| e.searched_depth)
+    }
+
+    fn is_known_terminal(&self, key: &[u8; 18]) -> Option<bool> {
+        self.cache.get(key).map(|e| e.is_terminal)
+    }
+
+    fn summary_by_depth(&self) -> Vec<(i64, i64, i64, i64, i64)> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT depth, COUNT(*), SUM(is_terminal), SUM(symmetry_count)
+                "SELECT depth, COUNT(*), SUM(is_terminal), SUM(symmetry_count),
+                        SUM(CASE WHEN searched_depth >= 1 THEN 1 ELSE 0 END)
                  FROM positions GROUP BY depth ORDER BY depth",
             )
             .expect("Failed to prepare summary");
@@ -231,346 +343,277 @@ impl BfsDb {
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             })
             .expect("Failed to query summary");
-        rows.filter_map(|r| r.ok()).collect()
+        rows.flatten().collect()
+    }
+
+    fn update_depth_if_shallower(&mut self, key: &[u8; 18], depth: usize) {
+        if let Some(entry) = self.cache.get_mut(key) {
+            if depth < entry.depth {
+                entry.depth = depth;
+                entry.dirty = true;
+            }
+        }
+    }
+
+    fn flush_depth_updates(&mut self) {
+        let dirty: Vec<([u8; 18], usize)> = self
+            .cache
+            .iter()
+            .filter(|(_, e)| e.dirty)
+            .map(|(k, e)| (*k, e.depth))
+            .collect();
+        if dirty.is_empty() {
+            return;
+        }
+        self.conn
+            .execute_batch("BEGIN TRANSACTION")
+            .expect("Failed to begin depth update txn");
+        {
+            let mut stmt = self
+                .conn
+                .prepare_cached(
+                    "UPDATE positions SET depth = MIN(depth, ?2) WHERE canonical_key = ?1",
+                )
+                .expect("Failed to prepare depth update");
+            for (key, depth) in &dirty {
+                stmt.execute(params![key.as_slice(), *depth as i64])
+                    .expect("Failed to update depth");
+            }
+        }
+        self.conn
+            .execute_batch("COMMIT")
+            .expect("Failed to commit depth updates");
+        for (key, _) in &dirty {
+            if let Some(entry) = self.cache.get_mut(key) {
+                entry.dirty = false;
+            }
+        }
     }
 }
 
-// ── BFS ──────────────────────────────────────────────────────────────
+// ── IDDFS Core ──────────────────────────────────────────────────────
 
-fn run_bfs(cli: &Cli) {
-    let db = BfsDb::open(&cli.db);
-
-    let (start_depth, mut seen, mut frontier) = if cli.resume {
-        db.restore_dropped_to_frontier();
-        let seen = db.load_seen();
-        let raw_frontier = db.load_frontier();
-        if seen.is_empty() {
-            eprintln!("[resume] No existing data, starting fresh.");
-            init_fresh(&db)
-        } else {
-            let min_depth = raw_frontier.iter().map(|f| f.2).min().unwrap_or(0);
-            let frontier: Vec<(Bitboard, [u8; 18])> =
-                raw_frontier.into_iter().map(|(bb, k, _)| (bb, k)).collect();
-            eprintln!(
-                "[resume] Loaded {} seen, {} frontier (depth {})",
-                seen.len(),
-                frontier.len(),
-                min_depth
-            );
-            (min_depth, seen, frontier)
-        }
-    } else {
-        init_fresh(&db)
-    };
-
-    if !cli.quiet {
-        println!(
-            "Rust BFS benchmark (max depth {}, starting from depth {})",
-            cli.depth, start_depth
-        );
-        println!(
-            "{:>5} {:>12} {:>12} {:>10} {:>12}",
-            "Depth", "Positions", "Frontier", "Time (s)", "Pos/sec"
-        );
-    }
-
-    let t_start = Instant::now();
-    let mut total_positions = seen.len();
-
-    for depth in start_depth..=cli.depth {
-        if frontier.is_empty() {
-            if !cli.quiet {
-                println!("  No more frontier nodes at depth {}. Done.", depth);
-            }
-            break;
-        }
-
-        let t_depth = Instant::now();
-        let mut next_frontier: Vec<(Bitboard, [u8; 18])> = Vec::new();
-        let mut processed = 0usize;
-        let mut batch_count = 0usize;
-
-        db.begin_transaction();
-
-        for &(bb, ref parent_key) in &frontier {
-            if is_terminal(&bb) {
-                db.mark_expanded(parent_key);
-                continue;
-            }
-
-            let moves = generate_legal_moves(&bb);
-            for m in &moves {
-                let child_bb = apply_move(&bb, m);
-                let child_key = canonical_key(&child_bb);
-
-                if seen.insert(child_key) {
-                    let terminal = is_terminal(&child_bb);
-                    let winner = determine_winner(&child_bb);
-                    let sym_count = SymmetryHandler::orbit_size(&child_bb);
-                    let move_str = move_to_string(m);
-
-                    db.insert_position(
-                        &child_key,
-                        Some(parent_key),
-                        Some(&move_str),
-                        depth,
-                        terminal,
-                        winner,
-                        sym_count,
-                        0,
-                    );
-
-                    if !terminal {
-                        next_frontier.push((child_bb, child_key));
-                    } else {
-                        db.mark_expanded(&child_key);
-                    }
-                    total_positions += 1;
-                    batch_count += 1;
-
-                    if batch_count >= 50_000 {
-                        db.commit_transaction();
-                        db.begin_transaction();
-                        batch_count = 0;
-                    }
-
-                    if let Some(max) = cli.max_positions {
-                        if total_positions >= max {
-                            db.commit_transaction();
-                            db.mark_dropped_frontier();
-                            if !cli.quiet {
-                                println!(
-                                    "  Dropout: reached {} positions (limit {})",
-                                    total_positions, max
-                                );
-                            }
-                            print_summary(&db, &t_start, cli.quiet);
-                            return;
-                        }
-                    }
-                }
-            }
-
-            db.mark_expanded(parent_key);
-            processed += 1;
-
-            if !cli.quiet && processed % PROGRESS_INTERVAL == 0 {
-                let elapsed = t_depth.elapsed().as_secs_f64();
-                let rate = if elapsed > 0.0 {
-                    total_positions as f64 / elapsed
-                } else {
-                    0.0
-                };
-                eprintln!(
-                    "  [depth {}] {}/{} expanded, {} total, {} frontier, {:.0} pos/sec, ~{} MB",
-                    depth,
-                    processed,
-                    frontier.len(),
-                    total_positions,
-                    next_frontier.len(),
-                    rate,
-                    estimate_memory_mb(&seen, &next_frontier)
-                );
-            }
-        }
-
-        db.commit_transaction();
-
-        let elapsed_depth = t_depth.elapsed().as_secs_f64();
-        let rate = if elapsed_depth > 0.0 {
-            total_positions as f64 / t_start.elapsed().as_secs_f64()
-        } else {
-            0.0
-        };
-
-        if !cli.quiet {
-            println!(
-                "{:>5} {:>12} {:>12} {:>10.3} {:>12.0}",
-                depth,
-                total_positions,
-                next_frontier.len(),
-                elapsed_depth,
-                rate
-            );
-        }
-
-        frontier = next_frontier;
-    }
-
-    print_summary(&db, &t_start, cli.quiet);
+struct IddfsState {
+    new_positions_this_iter: usize,
+    dropout: bool,
+    max_positions: Option<usize>,
 }
 
-// ── DFS ──────────────────────────────────────────────────────────────
-
-fn run_dfs(cli: &Cli) {
-    let db = BfsDb::open(&cli.db);
-
-    let (mut seen, stack) = if cli.resume {
-        db.restore_dropped_to_frontier();
-        let seen = db.load_seen();
-        let raw_frontier = db.load_frontier();
-        if seen.is_empty() {
-            eprintln!("[resume] No existing data, starting fresh.");
-            let (_, seen, frontier) = init_fresh(&db);
-            let stack: Vec<(Bitboard, [u8; 18], usize)> =
-                frontier.into_iter().map(|(bb, k)| (bb, k, 0)).collect();
-            (seen, stack)
-        } else {
-            let stack: Vec<(Bitboard, [u8; 18], usize)> = raw_frontier;
-            eprintln!(
-                "[resume] Loaded {} seen, {} frontier",
-                seen.len(),
-                stack.len()
-            );
-            (seen, stack)
-        }
-    } else {
-        let (_, seen, frontier) = init_fresh(&db);
-        let stack: Vec<(Bitboard, [u8; 18], usize)> =
-            frontier.into_iter().map(|(bb, k)| (bb, k, 0)).collect();
-        (seen, stack)
-    };
-
-    if !cli.quiet {
-        println!(
-            "Rust DFS benchmark (max depth {}, {} starting nodes)",
-            cli.depth,
-            stack.len()
-        );
+fn iddfs(
+    bb: Bitboard,
+    depth: usize,
+    depth_limit: usize,
+    builder: &mut BookBuilder,
+    state: &mut IddfsState,
+) {
+    if state.dropout {
+        return;
     }
 
-    let t_start = Instant::now();
-    let mut total_positions = seen.len();
-    let mut stack = stack;
-    let mut processed = 0usize;
-    let mut batch_count = 0usize;
+    let key = canonical_key(&bb);
+    let remaining = depth_limit - depth;
 
-    db.begin_transaction();
+    let already_searched = builder.searched_depth_for(&key);
+    if already_searched >= remaining {
+        return;
+    }
 
-    while let Some((bb, parent_key, depth)) = stack.pop() {
-        if depth >= cli.depth || is_terminal(&bb) {
-            db.mark_expanded(&parent_key);
-            continue;
-        }
-
-        let moves = generate_legal_moves(&bb);
-        for m in &moves {
-            let child_bb = apply_move(&bb, m);
-            let child_key = canonical_key(&child_bb);
-
-            if seen.insert(child_key) {
-                let terminal = is_terminal(&child_bb);
-                let winner = determine_winner(&child_bb);
-                let sym_count = SymmetryHandler::orbit_size(&child_bb);
-                let move_str = move_to_string(m);
-
-                db.insert_position(
-                    &child_key,
-                    Some(&parent_key),
-                    Some(&move_str),
-                    depth + 1,
-                    terminal,
-                    winner,
-                    sym_count,
-                    0,
-                );
-
-                if !terminal && depth + 1 < cli.depth {
-                    stack.push((child_bb, child_key, depth + 1));
-                } else {
-                    db.mark_expanded(&child_key);
-                }
-
-                total_positions += 1;
-                batch_count += 1;
-
-                if batch_count >= 50_000 {
-                    db.commit_transaction();
-                    db.begin_transaction();
-                    batch_count = 0;
-                }
-
-                if let Some(max) = cli.max_positions {
-                    if total_positions >= max {
-                        db.commit_transaction();
-                        db.mark_dropped_frontier();
-                        if !cli.quiet {
-                            println!(
-                                "  Dropout: reached {} positions (limit {})",
-                                total_positions, max
-                            );
-                        }
-                        print_summary(&db, &t_start, cli.quiet);
+    let terminal = match builder.is_known_terminal(&key) {
+        Some(t) => t,
+        None => {
+            let t = is_terminal(&bb);
+            let winner = if t { determine_winner(&bb) } else { None };
+            let sym = SymmetryHandler::orbit_size(&bb);
+            let is_new = builder.cache_position(key, depth, t, winner, sym);
+            if is_new {
+                state.new_positions_this_iter += 1;
+                if let Some(max) = state.max_positions {
+                    if builder.position_count() >= max {
+                        state.dropout = true;
                         return;
                     }
                 }
             }
+            t
+        }
+    };
+
+    builder.update_depth_if_shallower(&key, depth);
+
+    if depth >= depth_limit || terminal {
+        builder.update_searched_depth(&key, remaining);
+        if builder.should_flush() {
+            builder.flush();
+        }
+        return;
+    }
+
+    let moves = generate_legal_moves(&bb);
+    for m in &moves {
+        if state.dropout {
+            return;
+        }
+        let child_bb = apply_move(&bb, m);
+        let child_key = canonical_key(&child_bb);
+
+        let child_is_known = builder.cache.contains_key(&child_key);
+        if !child_is_known {
+            let t = is_terminal(&child_bb);
+            let winner = if t { determine_winner(&child_bb) } else { None };
+            let sym = SymmetryHandler::orbit_size(&child_bb);
+            let is_new = builder.cache_position(child_key, depth + 1, t, winner, sym);
+            if is_new {
+                state.new_positions_this_iter += 1;
+                if let Some(max) = state.max_positions {
+                    if builder.position_count() >= max {
+                        state.dropout = true;
+                    }
+                }
+            }
+        } else {
+            builder.update_depth_if_shallower(&child_key, depth + 1);
         }
 
-        db.mark_expanded(&parent_key);
-        processed += 1;
+        builder.cache_edge(key, child_key, move_to_string(m));
 
-        if !cli.quiet && processed % PROGRESS_INTERVAL == 0 {
-            let elapsed = t_start.elapsed().as_secs_f64();
-            let rate = if elapsed > 0.0 {
-                total_positions as f64 / elapsed
-            } else {
-                0.0
-            };
-            eprintln!(
-                "  [dfs] {} expanded, {} total, {} stack, {:.0} pos/sec",
-                processed, total_positions, stack.len(), rate
-            );
+        if builder.should_flush() {
+            builder.flush();
+        }
+
+        if !state.dropout {
+            iddfs(child_bb, depth + 1, depth_limit, builder, state);
         }
     }
 
-    db.commit_transaction();
-    print_summary(&db, &t_start, cli.quiet);
+    builder.update_searched_depth(&key, remaining);
+    builder.mark_expanded(&key);
+
+    if builder.should_flush() {
+        builder.flush();
+    }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────
+fn build_book(cli: &Cli) {
+    let mut builder = BookBuilder::open(&cli.db, cli.batch_size);
+    let exhaustive_depth = cli.exhaustive_depth.unwrap_or(cli.depth);
+    let max_depth = cli.depth;
 
-fn init_fresh(db: &BfsDb) -> (usize, HashSet<[u8; 18]>, Vec<(Bitboard, [u8; 18])>) {
+    if cli.resume {
+        eprintln!("[resume] Loading existing positions from database...");
+        builder.load_cache_from_db();
+        eprintln!("[resume] Loaded {} positions into cache", builder.position_count());
+    }
+
     let root = Bitboard::EMPTY;
     let root_key = canonical_key(&root);
-    let sym_count = SymmetryHandler::orbit_size(&root);
+    if !builder.cache.contains_key(&root_key) {
+        let sym = SymmetryHandler::orbit_size(&root);
+        builder.cache_position(root_key, 0, false, None, sym);
+        builder.flush();
+    }
 
-    db.insert_position(&root_key, None, None, 0, false, None, sym_count, 0);
+    if !cli.quiet {
+        println!(
+            "IDDFS Book Builder (exhaustive depth {}, max depth {})",
+            exhaustive_depth, max_depth
+        );
+        println!(
+            "{:>5}  {:>12}  {:>10}  {:>12}  {:>10}",
+            "Iter", "Positions", "New", "Edges", "Time (s)"
+        );
+    }
 
-    let mut seen = HashSet::new();
-    seen.insert(root_key);
-    (1, seen, vec![(root, root_key)])
+    let t_start = Instant::now();
+
+    for depth_limit in 1..=max_depth {
+        let t_iter = Instant::now();
+
+        let mut state = IddfsState {
+            new_positions_this_iter: 0,
+            dropout: false,
+            max_positions: cli.max_positions,
+        };
+
+        iddfs(root, 0, depth_limit, &mut builder, &mut state);
+
+        builder.flush();
+        builder.flush_depth_updates();
+
+        let elapsed = t_iter.elapsed().as_secs_f64();
+        let edge_count = builder.total_edge_count();
+
+        if !cli.quiet {
+            println!(
+                "{:>5}  {:>12}  {:>10}  {:>12}  {:>10.3}",
+                depth_limit,
+                builder.position_count(),
+                state.new_positions_this_iter,
+                edge_count,
+                elapsed,
+            );
+        }
+
+        if state.dropout {
+            if !cli.quiet {
+                println!(
+                    "  Dropout: reached {} positions (limit {})",
+                    builder.position_count(),
+                    cli.max_positions.unwrap_or(0)
+                );
+            }
+            break;
+        }
+
+        if depth_limit >= exhaustive_depth && depth_limit < max_depth {
+            if !cli.quiet {
+                eprintln!(
+                    "  [exhaustive phase complete at depth {}, switching to selective]",
+                    exhaustive_depth
+                );
+            }
+        }
+    }
+
+    print_summary(&builder, &t_start, cli.quiet);
 }
 
-fn estimate_memory_mb(seen: &HashSet<[u8; 18]>, frontier: &[(Bitboard, [u8; 18])]) -> usize {
-    let seen_bytes = seen.len() * (18 + 8); // key + hash overhead
-    let frontier_bytes = frontier.len() * (16 + 18 + 8); // Bitboard + key + Vec overhead
-    (seen_bytes + frontier_bytes) / (1024 * 1024)
-}
-
-fn print_summary(db: &BfsDb, t_start: &Instant, quiet: bool) {
+fn print_summary(builder: &BookBuilder, t_start: &Instant, quiet: bool) {
     let total = t_start.elapsed().as_secs_f64();
-    let count = db.total_count();
+    let count = builder.position_count();
+    let edges = builder.total_edge_count();
 
     println!("\n--- Summary ---");
     println!("Total positions: {}", count);
+    println!("Total edges: {}", edges);
     println!("Elapsed: {:.3}s", total);
     if total > 0.0 {
         println!("Throughput: {:.0} pos/sec", count as f64 / total);
     }
 
     if !quiet {
-        let by_depth = db.summary_by_depth();
+        let by_depth = builder.summary_by_depth();
         if !by_depth.is_empty() {
             println!(
-                "\n{:>5} {:>12} {:>10} {:>14}",
-                "Depth", "Positions", "Terminal", "SymmetrySum"
+                "\n{:>5}  {:>12}  {:>10}  {:>12}  {:>14}  {:>16}",
+                "Depth", "Positions", "Terminal", "Edges", "SymmetrySum", "SearchedDepth>=1"
             );
-            for (d, cnt, term, sym) in &by_depth {
-                println!("{:>5} {:>12} {:>10} {:>14}", d, cnt, term, sym);
+            for (d, cnt, term, sym, searched) in &by_depth {
+                let edge_count: i64 = builder
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM edges WHERE parent_key IN (SELECT canonical_key FROM positions WHERE depth = ?1)",
+                        params![d],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                println!(
+                    "{:>5}  {:>12}  {:>10}  {:>12}  {:>14}  {:>16}",
+                    d, cnt, term, edge_count, sym, searched
+                );
             }
         }
     }
@@ -578,10 +621,5 @@ fn print_summary(db: &BfsDb, t_start: &Instant, quiet: bool) {
 
 fn main() {
     let cli = Cli::parse();
-
-    if cli.dfs {
-        run_dfs(&cli);
-    } else {
-        run_bfs(&cli);
-    }
+    build_book(&cli);
 }
