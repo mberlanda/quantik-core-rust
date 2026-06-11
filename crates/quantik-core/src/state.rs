@@ -15,7 +15,9 @@ impl State {
     }
 
     pub fn empty() -> Self {
-        Self { bb: Bitboard::EMPTY }
+        Self {
+            bb: Bitboard::EMPTY,
+        }
     }
 
     // ── binary (18 bytes: version + flags + 8×u16 LE) ───────────────
@@ -31,7 +33,10 @@ impl State {
 
     pub fn unpack(data: &[u8]) -> Result<Self, String> {
         if data.len() < 18 {
-            return Err(format!("Buffer too small: need 18 bytes, got {}", data.len()));
+            return Err(format!(
+                "Buffer too small: need 18 bytes, got {}",
+                data.len()
+            ));
         }
         if data[0] != VERSION {
             return Err(format!("Unsupported version {}", data[0]));

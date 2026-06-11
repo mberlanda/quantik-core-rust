@@ -109,6 +109,7 @@ impl OpeningBookDatabase {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_position(
         &self,
         state: &State,
@@ -283,9 +284,9 @@ impl OpeningBookDatabase {
     }
 
     pub fn positions_by_depth(&self) -> SqlResult<Vec<(i32, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT depth, COUNT(*) FROM positions GROUP BY depth ORDER BY depth",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT depth, COUNT(*) FROM positions GROUP BY depth ORDER BY depth")?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect()
     }
@@ -330,8 +331,19 @@ mod tests {
         let db = OpeningBookDatabase::open(&config).unwrap();
 
         let state = State::empty();
-        db.add_position(&state, 0.0, 100, 50, 40, 10, &[(0, 0), (1, 5)], 0, TerminalStatus::Interior, 1)
-            .unwrap();
+        db.add_position(
+            &state,
+            0.0,
+            100,
+            50,
+            40,
+            10,
+            &[(0, 0), (1, 5)],
+            0,
+            TerminalStatus::Interior,
+            1,
+        )
+        .unwrap();
 
         let entry = db.get_position(&state).unwrap().unwrap();
         assert_eq!(entry.visit_count, 100);
@@ -354,8 +366,10 @@ mod tests {
         let s1 = State::empty();
         let s2 = State::from_qfen("A.../..../..../....").unwrap();
 
-        db.add_position(&s1, 0.0, 1, 0, 0, 0, &[], 0, TerminalStatus::Interior, 1).unwrap();
-        db.add_position(&s2, 0.1, 1, 0, 0, 0, &[], 1, TerminalStatus::Interior, 1).unwrap();
+        db.add_position(&s1, 0.0, 1, 0, 0, 0, &[], 0, TerminalStatus::Interior, 1)
+            .unwrap();
+        db.add_position(&s2, 0.1, 1, 0, 0, 0, &[], 1, TerminalStatus::Interior, 1)
+            .unwrap();
 
         let k1 = s1.canonical_key();
         let k2 = s2.canonical_key();
@@ -383,7 +397,19 @@ mod tests {
         let db = OpeningBookDatabase::open(&config).unwrap();
 
         let state = State::empty();
-        db.add_position(&state, 0.0, 10, 5, 3, 2, &[], 0, TerminalStatus::Interior, 1).unwrap();
+        db.add_position(
+            &state,
+            0.0,
+            10,
+            5,
+            3,
+            2,
+            &[],
+            0,
+            TerminalStatus::Interior,
+            1,
+        )
+        .unwrap();
 
         let entries = db.query_by_depth(0, 10).unwrap();
         assert_eq!(entries.len(), 1);

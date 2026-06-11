@@ -76,6 +76,11 @@ fn is_terminal(bb: &Bitboard) -> bool {
 
 // ── In-memory position cache ────────────────────────────────────────
 
+type CanonicalKey = [u8; 18];
+type EdgeRecord = (CanonicalKey, CanonicalKey, String);
+type NewPosition = (CanonicalKey, usize, bool, Option<u8>, usize);
+type SearchedDepthUpdate = (CanonicalKey, usize);
+
 struct PositionEntry {
     depth: usize,
     searched_depth: usize,
@@ -85,11 +90,11 @@ struct PositionEntry {
 
 struct BookBuilder {
     conn: Connection,
-    cache: HashMap<[u8; 18], PositionEntry>,
-    edge_buffer: Vec<([u8; 18], [u8; 18], String)>,
-    new_positions: Vec<([u8; 18], usize, bool, Option<u8>, usize)>,
-    pending_searched_updates: Vec<([u8; 18], usize)>,
-    pending_status_updates: Vec<[u8; 18]>,
+    cache: HashMap<CanonicalKey, PositionEntry>,
+    edge_buffer: Vec<EdgeRecord>,
+    new_positions: Vec<NewPosition>,
+    pending_searched_updates: Vec<SearchedDepthUpdate>,
+    pending_status_updates: Vec<CanonicalKey>,
     batch_size: usize,
     ops_since_commit: usize,
     total_edges_inserted: usize,
@@ -156,7 +161,12 @@ impl BookBuilder {
                 let is_terminal: i32 = row.get(3)?;
                 let mut key = [0u8; 18];
                 key.copy_from_slice(&blob);
-                Ok((key, depth as usize, searched_depth as usize, is_terminal != 0))
+                Ok((
+                    key,
+                    depth as usize,
+                    searched_depth as usize,
+                    is_terminal != 0,
+                ))
             })
             .expect("Failed to query cache");
         for r in rows.flatten() {
@@ -505,7 +515,10 @@ fn build_book(cli: &Cli) {
     if cli.resume {
         eprintln!("[resume] Loading existing positions from database...");
         builder.load_cache_from_db();
-        eprintln!("[resume] Loaded {} positions into cache", builder.position_count());
+        eprintln!(
+            "[resume] Loaded {} positions into cache",
+            builder.position_count()
+        );
     }
 
     let root = Bitboard::EMPTY;
@@ -568,13 +581,11 @@ fn build_book(cli: &Cli) {
             break;
         }
 
-        if depth_limit >= exhaustive_depth && depth_limit < max_depth {
-            if !cli.quiet {
-                eprintln!(
-                    "  [exhaustive phase complete at depth {}, switching to selective]",
-                    exhaustive_depth
-                );
-            }
+        if depth_limit >= exhaustive_depth && depth_limit < max_depth && !cli.quiet {
+            eprintln!(
+                "  [exhaustive phase complete at depth {}, switching to selective]",
+                exhaustive_depth
+            );
         }
     }
 

@@ -79,8 +79,7 @@ impl QuantikBoard {
                         player, used, shape, MAX_PIECES_PER_SHAPE
                     ));
                 }
-                invs[player as usize].remaining[shape as usize] =
-                    MAX_PIECES_PER_SHAPE - used;
+                invs[player as usize].remaining[shape as usize] = MAX_PIECES_PER_SHAPE - used;
             }
         }
         Ok(Self {

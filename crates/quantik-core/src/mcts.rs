@@ -25,7 +25,7 @@ struct MCTSNode {
     bb: Bitboard,
     parent: Option<usize>,
     children: Vec<usize>,
-    mv: Option<Move>,    // move that led here
+    mv: Option<Move>, // move that led here
     visit_count: u32,
     win_count_p0: u32,
     win_count_p1: u32,
@@ -137,7 +137,9 @@ impl MCTSEngine {
             return node_id;
         }
 
-        let idx = self.rng.gen_range(0..self.nodes[node_id].untried_moves.len());
+        let idx = self
+            .rng
+            .gen_range(0..self.nodes[node_id].untried_moves.len());
         let mv = self.nodes[node_id].untried_moves.swap_remove(idx);
         let parent_bb = self.nodes[node_id].bb;
         let new_bb = apply_move(&parent_bb, &mv);
@@ -150,7 +152,11 @@ impl MCTSEngine {
             WinStatus::Player1Wins => -1.0,
             WinStatus::NoWin if legal.is_empty() => {
                 // No legal moves: the player who cannot move loses
-                if current_player(&new_bb) == Some(0) { -1.0 } else { 1.0 }
+                if current_player(&new_bb) == Some(0) {
+                    -1.0
+                } else {
+                    1.0
+                }
             }
             WinStatus::NoWin => 0.0,
         };
@@ -197,7 +203,11 @@ impl MCTSEngine {
             let moves = generate_legal_moves(&current_bb);
             if moves.is_empty() {
                 // No legal moves: the player who cannot move loses
-                return if current_player(&current_bb) == Some(0) { -1.0 } else { 1.0 };
+                return if current_player(&current_bb) == Some(0) {
+                    -1.0
+                } else {
+                    1.0
+                };
             }
             let mv = moves[self.rng.gen_range(0..moves.len())];
             current_bb = apply_move(&current_bb, &mv);

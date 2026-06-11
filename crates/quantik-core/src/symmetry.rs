@@ -11,14 +11,14 @@ const D4_MAPS: [PosMap; 8] = {
         let r = i / 4;
         let c = i % 4;
 
-        maps[0][i as usize] = r * 4 + c;                          // id
-        maps[1][i as usize] = c * 4 + (3 - r);                    // rot90
-        maps[2][i as usize] = (3 - r) * 4 + (3 - c);              // rot180
-        maps[3][i as usize] = (3 - c) * 4 + r;                    // rot270
-        maps[4][i as usize] = r * 4 + (3 - c);                    // reflV
-        maps[5][i as usize] = (3 - r) * 4 + c;                    // reflH
-        maps[6][i as usize] = c * 4 + r;                          // reflD
-        maps[7][i as usize] = (3 - c) * 4 + (3 - r);              // reflAD
+        maps[0][i as usize] = r * 4 + c; // id
+        maps[1][i as usize] = c * 4 + (3 - r); // rot90
+        maps[2][i as usize] = (3 - r) * 4 + (3 - c); // rot180
+        maps[3][i as usize] = (3 - c) * 4 + r; // rot270
+        maps[4][i as usize] = r * 4 + (3 - c); // reflV
+        maps[5][i as usize] = (3 - r) * 4 + c; // reflH
+        maps[6][i as usize] = c * 4 + r; // reflD
+        maps[7][i as usize] = (3 - c) * 4 + (3 - r); // reflAD
 
         i += 1;
     }
@@ -35,10 +35,16 @@ const fn generate_shape_perms() -> [[u8; 4]; 24] {
     while a < 4 {
         let mut b: u8 = 0;
         while b < 4 {
-            if b == a { b += 1; continue; }
+            if b == a {
+                b += 1;
+                continue;
+            }
             let mut c: u8 = 0;
             while c < 4 {
-                if c == a || c == b { c += 1; continue; }
+                if c == a || c == b {
+                    c += 1;
+                    continue;
+                }
                 let d = 6 - a - b - c; // the remaining element (0+1+2+3=6)
                 perms[idx] = [a, b, c, d];
                 idx += 1;

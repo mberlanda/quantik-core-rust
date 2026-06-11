@@ -7,6 +7,7 @@ use quantik_core::moves::{apply_move, generate_legal_moves, Move};
 use quantik_core::symmetry::SymmetryHandler;
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::time::Instant;
@@ -58,6 +59,10 @@ const STATUS_SOLVED: i32 = 3;
 const BATCH_SIZE: usize = 10_000;
 const PROGRESS_INTERVAL: usize = 10_000;
 
+type CanonicalKey = [u8; 18];
+type SeenSet = HashSet<CanonicalKey>;
+type Frontier = Vec<(Bitboard, CanonicalKey)>;
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 fn canonical_key(bb: &Bitboard) -> [u8; 18] {
@@ -99,7 +104,11 @@ fn terminal_score(bb: &Bitboard) -> f64 {
     if has_winning_line(bb) {
         let p0 = bb.player_piece_count(0);
         let p1 = bb.player_piece_count(1);
-        if p0 > p1 { 1.0 } else { -1.0 }
+        if p0 > p1 {
+            1.0
+        } else {
+            -1.0
+        }
     } else {
         match current_player(bb) {
             Some(0) => -1.0,
@@ -200,11 +209,11 @@ fn rank_moves(bb: &Bitboard, moves: &[Move]) -> Vec<(Move, i32)> {
         })
         .collect();
 
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by_key(|(_, score)| Reverse(*score));
     scored
 }
 
-fn estimate_memory_mb(seen: &HashSet<[u8; 18]>, frontier: &[(Bitboard, [u8; 18])]) -> usize {
+fn estimate_memory_mb(seen: &SeenSet, frontier: &Frontier) -> usize {
     let seen_bytes = seen.len() * (18 + 8);
     let frontier_bytes = frontier.len() * (16 + 18 + 8);
     (seen_bytes + frontier_bytes) / (1024 * 1024)
@@ -264,15 +273,14 @@ impl BookDb {
     }
 
     fn begin(&self) {
-        self.conn
-            .execute_batch("BEGIN TRANSACTION")
-            .expect("begin");
+        self.conn.execute_batch("BEGIN TRANSACTION").expect("begin");
     }
 
     fn commit(&self) {
         self.conn.execute_batch("COMMIT").expect("commit");
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_position(
         &self,
         key: &[u8; 18],
@@ -436,9 +444,7 @@ impl BookDb {
 
     fn edge_count(&self) -> usize {
         self.conn
-            .query_row("SELECT COUNT(*) FROM edges", [], |row| {
-                row.get::<_, i64>(0)
-            })
+            .query_row("SELECT COUNT(*) FROM edges", [], |row| row.get::<_, i64>(0))
             .unwrap_or(0) as usize
     }
 
@@ -520,9 +526,7 @@ impl BookDb {
 
     fn book_count(&self) -> usize {
         self.conn
-            .query_row("SELECT COUNT(*) FROM book", [], |row| {
-                row.get::<_, i64>(0)
-            })
+            .query_row("SELECT COUNT(*) FROM book", [], |row| row.get::<_, i64>(0))
             .unwrap_or(0) as usize
     }
 }
@@ -609,7 +613,9 @@ fn run_exhaustive_bfs(db: &BookDb, cli: &Cli) -> (HashSet<[u8; 18]>, usize) {
                         STATUS_FRONTIER
                     };
 
-                    db.insert_position(&child_key, depth, terminal, winner, sym_count, score, status);
+                    db.insert_position(
+                        &child_key, depth, terminal, winner, sym_count, score, status,
+                    );
 
                     if !terminal {
                         next_frontier.push((child_bb, child_key));
@@ -641,7 +647,7 @@ fn run_exhaustive_bfs(db: &BookDb, cli: &Cli) -> (HashSet<[u8; 18]>, usize) {
             db.update_status(parent_key, STATUS_EXPANDED);
             processed += 1;
 
-            if !cli.quiet && processed % PROGRESS_INTERVAL == 0 {
+            if !cli.quiet && processed.is_multiple_of(PROGRESS_INTERVAL) {
                 let elapsed = t_depth.elapsed().as_secs_f64();
                 let rate = if elapsed > 0.0 {
                     total_positions as f64 / elapsed
@@ -674,7 +680,11 @@ fn run_exhaustive_bfs(db: &BookDb, cli: &Cli) -> (HashSet<[u8; 18]>, usize) {
         if !cli.quiet {
             eprintln!(
                 "\r{:>5} {:>12} {:>12} {:>10.3} {:>12.0}",
-                depth, total_positions, next_frontier.len(), elapsed_depth, rate
+                depth,
+                total_positions,
+                next_frontier.len(),
+                elapsed_depth,
+                rate
             );
         }
 
@@ -693,7 +703,7 @@ fn run_exhaustive_bfs(db: &BookDb, cli: &Cli) -> (HashSet<[u8; 18]>, usize) {
     (seen, total_positions)
 }
 
-fn init_fresh(db: &BookDb) -> (usize, HashSet<[u8; 18]>, Vec<(Bitboard, [u8; 18])>) {
+fn init_fresh(db: &BookDb) -> (usize, SeenSet, Frontier) {
     let root = Bitboard::EMPTY;
     let root_key = canonical_key(&root);
     let sym_count = SymmetryHandler::orbit_size(&root);
@@ -1034,7 +1044,11 @@ fn export_compact_book(db: &BookDb, quiet: bool) {
             continue;
         }
 
-        moves.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        moves.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let json = serde_json::to_string(&moves).unwrap_or_default();
         db.insert_book_entry(key, &json);
         exported += 1;
@@ -1067,7 +1081,10 @@ fn print_summary(db: &BookDb, total_elapsed: f64, quiet: bool) {
     println!("Book entries:    {}", book);
     println!("Elapsed:         {:.3}s", total_elapsed);
     if total_elapsed > 0.0 {
-        println!("Throughput:      {:.0} pos/sec", count as f64 / total_elapsed);
+        println!(
+            "Throughput:      {:.0} pos/sec",
+            count as f64 / total_elapsed
+        );
     }
 
     if !quiet {

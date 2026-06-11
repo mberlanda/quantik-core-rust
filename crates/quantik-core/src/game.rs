@@ -10,13 +10,11 @@ pub enum WinStatus {
 
 /// Check whether any win line contains all 4 distinct shapes (regardless of color).
 pub fn has_winning_line(bb: &Bitboard) -> bool {
-    let shape_unions: [u16; NUM_SHAPES] = std::array::from_fn(|s| {
-        bb.planes[s] | bb.planes[s + 4]
-    });
+    let shape_unions: [u16; NUM_SHAPES] = std::array::from_fn(|s| bb.planes[s] | bb.planes[s + 4]);
 
-    WIN_MASKS.iter().any(|&mask| {
-        shape_unions.iter().all(|&su| su & mask != 0)
-    })
+    WIN_MASKS
+        .iter()
+        .any(|&mask| shape_unions.iter().all(|&su| su & mask != 0))
 }
 
 /// Determine winner.  The last player to move (the one with more pieces on the
@@ -66,9 +64,9 @@ mod tests {
     fn row_0_win() {
         // Place A(p0) at 0, B(p1) at 1, C(p0) at 2, D(p1) at 3
         let bb = Bitboard::EMPTY
-            .with_move(0, 0, 0)  // A at pos 0
-            .with_move(1, 1, 1)  // b at pos 1
-            .with_move(0, 2, 2)  // C at pos 2
+            .with_move(0, 0, 0) // A at pos 0
+            .with_move(1, 1, 1) // b at pos 1
+            .with_move(0, 2, 2) // C at pos 2
             .with_move(1, 3, 3); // d at pos 3
         assert!(has_winning_line(&bb));
         // p0 has 2, p1 has 2 → p1 wins (equal means last mover is p1 when 4 total)

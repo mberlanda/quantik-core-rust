@@ -8,7 +8,7 @@ use crate::constants::SHAPE_LETTERS;
 pub fn bb_to_qfen(bb: &Bitboard) -> String {
     let mut ranks = [String::new(), String::new(), String::new(), String::new()];
 
-    for r in 0..4 {
+    for (r, rank) in ranks.iter_mut().enumerate() {
         for c in 0..4 {
             let pos = r * 4 + c;
             let mut ch = '.';
@@ -24,7 +24,7 @@ pub fn bb_to_qfen(bb: &Bitboard) -> String {
                     }
                 }
             }
-            ranks[r].push(ch);
+            rank.push(ch);
         }
     }
     ranks.join("/")
@@ -41,11 +41,7 @@ pub fn bb_from_qfen(qfen: &str) -> Result<Bitboard, String> {
     for (r, rank) in parts.iter().enumerate() {
         let chars: Vec<char> = rank.chars().collect();
         if chars.len() != 4 {
-            return Err(format!(
-                "Rank {} must have 4 chars, got {}",
-                r,
-                chars.len()
-            ));
+            return Err(format!("Rank {} must have 4 chars, got {}", r, chars.len()));
         }
         for (c, &ch) in chars.iter().enumerate() {
             if ch == '.' {
