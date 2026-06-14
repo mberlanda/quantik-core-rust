@@ -14,7 +14,11 @@ impl Move {
         debug_assert!(player <= 1);
         debug_assert!(shape < 4);
         debug_assert!(position < 16);
-        Self { player, shape, position }
+        Self {
+            player,
+            shape,
+            position,
+        }
     }
 }
 
@@ -56,9 +60,9 @@ pub fn generate_legal_moves(bb: &Bitboard) -> Vec<Move> {
                 continue;
             }
             let pos_mask = 1u16 << pos;
-            let blocked = WIN_MASKS.iter().any(|&wm| {
-                (pos_mask & wm != 0) && (opp_bits & wm != 0)
-            });
+            let blocked = WIN_MASKS
+                .iter()
+                .any(|&wm| (pos_mask & wm != 0) && (opp_bits & wm != 0));
             if !blocked {
                 moves.push(Move::new(player, shape, pos));
             }
@@ -99,7 +103,7 @@ mod tests {
         // column 0 (positions 4,8,12), or zone top-left (positions 1,4,5)
         assert!(!is_move_legal(&bb, 1, 0, 1)); // same row
         assert!(!is_move_legal(&bb, 1, 0, 4)); // same col & zone
-        // But player 1 can place shape A at position 10 (no shared line)
+                                               // But player 1 can place shape A at position 10 (no shared line)
         assert!(is_move_legal(&bb, 1, 0, 10));
     }
 
