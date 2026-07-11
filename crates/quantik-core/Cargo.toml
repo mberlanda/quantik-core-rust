@@ -5,6 +5,7 @@ edition = "2021"
 description = "High-performance Quantik board game engine"
 
 [dependencies]
+libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
