@@ -1,3 +1,4 @@
+pub mod beam_search;
 pub mod bitboard;
 pub mod board;
 pub mod constants;
