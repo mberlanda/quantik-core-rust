@@ -1,6 +1,7 @@
 pub mod bitboard;
 pub mod board;
 pub mod constants;
+pub mod evaluation;
 pub mod game;
 pub mod mcts;
 pub mod moves;
