@@ -5,3 +5,4 @@ Cargo.lock
 *.db-wal
 *.db-shm
 bfs_checkpoints/
+benchmarks/results/
