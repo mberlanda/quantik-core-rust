@@ -1,13 +1,24 @@
 use crate::bitboard::Bitboard;
 use crate::game::{check_winner, current_player, WinStatus};
 use crate::moves::{apply_move, generate_legal_moves, Move};
+use crate::state::State;
 use rand::prelude::*;
+use std::collections::HashMap;
+use std::time::Instant;
 
 pub struct MCTSConfig {
     pub exploration_weight: f64,
     pub max_iterations: u32,
     pub max_depth: u32,
     pub seed: Option<u64>,
+    /// Optional wall-clock budget for `search`, in seconds. Checked after
+    /// each completed iteration; `None` means the iteration count is the
+    /// only stop condition.
+    pub time_limit_s: Option<f64>,
+    /// Merge children that reach an already-seen canonical state into the
+    /// existing node instead of allocating a fresh one. `false` always
+    /// allocates, so revisited canonical states get independent statistics.
+    pub use_transposition_table: bool,
 }
 
 impl Default for MCTSConfig {
@@ -17,31 +28,40 @@ impl Default for MCTSConfig {
             max_iterations: 10_000,
             max_depth: 16,
             seed: None,
+            time_limit_s: None,
+            use_transposition_table: true,
         }
     }
 }
 
 struct MCTSNode {
     bb: Bitboard,
-    parent: Option<usize>,
     children: Vec<usize>,
-    mv: Option<Move>, // move that led here
+    mv: Option<Move>, // move that led here (first discovery)
     visit_count: u32,
     win_count_p0: u32,
     win_count_p1: u32,
     untried_moves: Vec<Move>,
     is_terminal: bool,
-    terminal_value: f64, // +1 p0 win, -1 p1 win, 0 draw
+    terminal_value: f64, // +1 p0 win, -1 p1 win
 }
 
 pub struct MCTSEngine {
     config: MCTSConfig,
     nodes: Vec<MCTSNode>,
+    transpositions: HashMap<[u8; 18], usize>,
     rng: StdRng,
+    iterations_performed: u32,
 }
 
 impl MCTSEngine {
     pub fn new(config: MCTSConfig) -> Self {
+        if let Some(limit) = config.time_limit_s {
+            assert!(
+                limit > 0.0 && limit.is_finite(),
+                "time_limit_s must be positive and finite, got {limit}"
+            );
+        }
         let rng = match config.seed {
             Some(s) => StdRng::seed_from_u64(s),
             None => StdRng::from_entropy(),
@@ -49,13 +69,18 @@ impl MCTSEngine {
         Self {
             config,
             nodes: Vec::new(),
+            transpositions: HashMap::new(),
             rng,
+            iterations_performed: 0,
         }
     }
 
-    /// Run MCTS from the given bitboard and return (best_move, win_probability_for_p0).
+    /// Run MCTS from the given bitboard and return
+    /// `(best_move, win_probability_for_the_root_mover)`.
     pub fn search(&mut self, bb: &Bitboard) -> Option<(Move, f64)> {
         self.nodes.clear();
+        self.transpositions.clear();
+        self.iterations_performed = 0;
 
         let legal = generate_legal_moves(bb);
         if legal.is_empty() {
@@ -72,7 +97,6 @@ impl MCTSEngine {
 
         self.nodes.push(MCTSNode {
             bb: *bb,
-            parent: None,
             children: Vec::new(),
             mv: None,
             visit_count: 0,
@@ -83,30 +107,52 @@ impl MCTSEngine {
             terminal_value,
         });
 
+        let deadline = self
+            .config
+            .time_limit_s
+            .map(|s| Instant::now() + std::time::Duration::from_secs_f64(s));
+
         for _ in 0..self.config.max_iterations {
-            let selected = self.select(0);
-            let expanded = self.expand(selected);
+            let mut path = self.select(0);
+            let leaf = *path.last().expect("path always contains the root");
+            let expanded = self.expand(leaf);
+            if expanded != leaf {
+                path.push(expanded);
+            }
             let value = self.simulate(expanded);
-            self.backpropagate(expanded, value);
+            self.backpropagate(&path, value);
+            self.iterations_performed += 1;
+
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
         }
 
-        self.best_move()
+        self.best_move(bb)
     }
 
-    fn select(&self, mut node_id: usize) -> usize {
+    /// Descend by UCB1 from `node_id`, returning the visited path
+    /// (root..=leaf). Backpropagation follows this exact path — with
+    /// transposition merging a node can have several parents, so parent
+    /// pointers would be ambiguous.
+    fn select(&self, node_id: usize) -> Vec<usize> {
+        let mut path = vec![node_id];
+        let mut current = node_id;
         loop {
-            let node = &self.nodes[node_id];
-            if node.is_terminal {
-                return node_id;
-            }
-            if !node.untried_moves.is_empty() {
-                return node_id;
-            }
-            if node.children.is_empty() {
-                return node_id;
+            let node = &self.nodes[current];
+            if node.is_terminal || !node.untried_moves.is_empty() || node.children.is_empty() {
+                return path;
             }
             let parent_visits = node.visit_count as f64;
             let c = self.config.exploration_weight;
+            // The win rate must be from the perspective of the player
+            // choosing among this node's children — the side to move at
+            // THIS node — not player 0. Using p0's count unconditionally
+            // systematically preferred moves that were worse for the
+            // player actually choosing.
+            let mover = current_player(&node.bb).unwrap_or(0);
 
             let mut best_ucb = f64::NEG_INFINITY;
             let mut best_child = node.children[0];
@@ -117,7 +163,11 @@ impl MCTSEngine {
                     break;
                 }
                 let child_visits = child.visit_count as f64;
-                let wins = child.win_count_p0 as f64;
+                let wins = if mover == 0 {
+                    child.win_count_p0 as f64
+                } else {
+                    child.win_count_p1 as f64
+                };
                 let win_rate = wins / child_visits;
                 let ucb = win_rate + c * (parent_visits.ln() / child_visits).sqrt();
                 if ucb > best_ucb {
@@ -125,15 +175,13 @@ impl MCTSEngine {
                     best_child = child_id;
                 }
             }
-            node_id = best_child;
+            path.push(best_child);
+            current = best_child;
         }
     }
 
     fn expand(&mut self, node_id: usize) -> usize {
-        if self.nodes[node_id].is_terminal {
-            return node_id;
-        }
-        if self.nodes[node_id].untried_moves.is_empty() {
+        if self.nodes[node_id].is_terminal || self.nodes[node_id].untried_moves.is_empty() {
             return node_id;
         }
 
@@ -143,6 +191,16 @@ impl MCTSEngine {
         let mv = self.nodes[node_id].untried_moves.swap_remove(idx);
         let parent_bb = self.nodes[node_id].bb;
         let new_bb = apply_move(&parent_bb, &mv);
+
+        if self.config.use_transposition_table {
+            let key = State::new(new_bb).canonical_key();
+            if let Some(&existing) = self.transpositions.get(&key) {
+                if !self.nodes[node_id].children.contains(&existing) {
+                    self.nodes[node_id].children.push(existing);
+                }
+                return existing;
+            }
+        }
 
         let legal = generate_legal_moves(&new_bb);
         let terminal = check_winner(&new_bb);
@@ -164,7 +222,6 @@ impl MCTSEngine {
         let child_id = self.nodes.len();
         self.nodes.push(MCTSNode {
             bb: new_bb,
-            parent: Some(node_id),
             children: Vec::new(),
             mv: Some(mv),
             visit_count: 0,
@@ -174,6 +231,10 @@ impl MCTSEngine {
             is_terminal,
             terminal_value,
         });
+        if self.config.use_transposition_table {
+            self.transpositions
+                .insert(State::new(new_bb).canonical_key(), child_id);
+        }
 
         self.nodes[node_id].children.push(child_id);
         child_id
@@ -215,8 +276,8 @@ impl MCTSEngine {
         }
     }
 
-    fn backpropagate(&mut self, mut node_id: usize, value: f64) {
-        loop {
+    fn backpropagate(&mut self, path: &[usize], value: f64) {
+        for &node_id in path.iter().rev() {
             let node = &mut self.nodes[node_id];
             node.visit_count += 1;
             if value > 0.0 {
@@ -224,14 +285,10 @@ impl MCTSEngine {
             } else if value < 0.0 {
                 node.win_count_p1 += 1;
             }
-            match node.parent {
-                Some(pid) => node_id = pid,
-                None => break,
-            }
         }
     }
 
-    fn best_move(&self) -> Option<(Move, f64)> {
+    fn best_move(&self, root_bb: &Bitboard) -> Option<(Move, f64)> {
         let root = &self.nodes[0];
         if root.children.is_empty() {
             return None;
@@ -248,8 +305,16 @@ impl MCTSEngine {
         }
 
         let child = &self.nodes[best_child];
+        // Win probability from the perspective of the player who made the
+        // choice at the root (the root's mover), matching the UCB fix.
+        let mover = current_player(root_bb).unwrap_or(0);
         let win_rate = if child.visit_count > 0 {
-            child.win_count_p0 as f64 / child.visit_count as f64
+            let wins = if mover == 0 {
+                child.win_count_p0 as f64
+            } else {
+                child.win_count_p1 as f64
+            };
+            wins / child.visit_count as f64
         } else {
             0.5
         };
@@ -258,11 +323,7 @@ impl MCTSEngine {
     }
 
     pub fn iterations_performed(&self) -> u32 {
-        if self.nodes.is_empty() {
-            0
-        } else {
-            self.nodes[0].visit_count
-        }
+        self.iterations_performed
     }
 
     pub fn nodes_created(&self) -> usize {
@@ -273,6 +334,7 @@ impl MCTSEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::has_winning_line;
 
     #[test]
     fn mcts_returns_a_move() {
@@ -292,9 +354,6 @@ mod tests {
 
     #[test]
     fn mcts_finds_winning_move() {
-        // Setup: A@0, b@5, C@2  → player 1 to move.
-        // Row 0 has shapes A, C. If p1 places d@3 and then p0 places B@1, that's a win.
-        // But more directly: test that MCTS returns *some* move for this position.
         let bb = Bitboard::EMPTY
             .with_move(0, 0, 0)
             .with_move(1, 1, 5)
@@ -321,8 +380,86 @@ mod tests {
             seed: Some(1),
             ..Default::default()
         });
-        let result = engine.search(&bb);
-        // Terminal board → no legal moves → None
-        assert!(result.is_none());
+        // The root is detected terminal, so it is never expanded: no
+        // children exist and no best move can be reported.
+        assert!(engine.search(&bb).is_none());
+    }
+
+    /// Regression for the UCB perspective bug: player 1 to move with an
+    /// immediate winning reply must select it. With the old p0-perspective
+    /// selection, p1's winning move was systematically starved.
+    #[test]
+    fn mcts_picks_immediate_win_for_player_1() {
+        // A@0, b@1, C@2: p1 to move, d@3 completes row 0 and wins for p1.
+        let bb = Bitboard::EMPTY
+            .with_move(0, 0, 0)
+            .with_move(1, 1, 1)
+            .with_move(0, 2, 2);
+        let mut engine = MCTSEngine::new(MCTSConfig {
+            max_iterations: 3_000,
+            seed: Some(7),
+            ..Default::default()
+        });
+        let (mv, prob) = engine.search(&bb).unwrap();
+        let after = apply_move(&bb, &mv);
+        assert!(
+            has_winning_line(&after),
+            "p1 must play the immediate win, got {mv:?} (prob {prob})"
+        );
+        assert!(prob > 0.5, "win probability is for the root mover");
+    }
+
+    #[test]
+    fn time_limit_stops_early() {
+        let mut engine = MCTSEngine::new(MCTSConfig {
+            max_iterations: u32::MAX,
+            seed: Some(3),
+            time_limit_s: Some(0.05),
+            ..Default::default()
+        });
+        let start = Instant::now();
+        let result = engine.search(&Bitboard::EMPTY);
+        assert!(result.is_some());
+        assert!(start.elapsed().as_secs_f64() < 1.0);
+        assert!(engine.iterations_performed() < u32::MAX);
+        assert!(engine.iterations_performed() > 0);
+    }
+
+    #[test]
+    fn same_seed_same_move() {
+        let bb = Bitboard::EMPTY.with_move(0, 0, 0);
+        let run = |seed| {
+            let mut engine = MCTSEngine::new(MCTSConfig {
+                max_iterations: 300,
+                seed: Some(seed),
+                ..Default::default()
+            });
+            engine.search(&bb).unwrap().0
+        };
+        assert_eq!(run(11), run(11));
+    }
+
+    #[test]
+    fn transposition_table_reduces_nodes() {
+        let run = |use_tt| {
+            let mut engine = MCTSEngine::new(MCTSConfig {
+                max_iterations: 2_000,
+                seed: Some(5),
+                use_transposition_table: use_tt,
+                ..Default::default()
+            });
+            engine.search(&Bitboard::EMPTY).unwrap();
+            engine.nodes_created()
+        };
+        assert!(run(true) < run(false));
+    }
+
+    #[test]
+    #[should_panic(expected = "time_limit_s must be positive")]
+    fn invalid_time_limit_panics() {
+        MCTSEngine::new(MCTSConfig {
+            time_limit_s: Some(0.0),
+            ..Default::default()
+        });
     }
 }
