@@ -1,0 +1,649 @@
+{
+  "checksum": "a9aa7c316092be3b9a22c54e4306315e54d38af5bbe931f600c9ccd48213b9aa",
+  "generator": "benchmarks.dataset.generate/v1",
+  "positions": [
+    {
+      "id": "p0000",
+      "legal_moves": 41,
+      "phase": "opening",
+      "pieces": 3,
+      "qfen": "..../...c/..../..AB",
+      "reference": null,
+      "side_to_move": 1
+    },
+    {
+      "id": "p0001",
+      "legal_moves": 40,
+      "phase": "opening",
+      "pieces": 4,
+      "qfen": "c.../..c./B.../D...",
+      "reference": null,
+      "side_to_move": 0
+    },
+    {
+      "id": "p0002",
+      "legal_moves": 53,
+      "phase": "opening",
+      "pieces": 1,
+      "qfen": "..../..../..../A...",
+      "reference": null,
+      "side_to_move": 1
+    },
+    {
+      "id": "p0003",
+      "legal_moves": 27,
+      "phase": "opening",
+      "pieces": 4,
+      "qfen": "..../..Ad/..d./.A..",
+      "reference": null,
+      "side_to_move": 0
+    },
+    {
+      "id": "p0004",
+      "legal_moves": 64,
+      "phase": "opening",
+      "pieces": 0,
+      "qfen": "..../..../..../....",
+      "reference": null,
+      "side_to_move": 0
+    },
+    {
+      "id": "p0005",
+      "legal_moves": 49,
+      "phase": "opening",
+      "pieces": 2,
+      "qfen": "..../...a/..../..C.",
+      "reference": null,
+      "side_to_move": 0
+    },
+    {
+      "id": "p0006",
+      "legal_moves": 39,
+      "phase": "opening",
+      "pieces": 4,
+      "qfen": "c..c/..../A.../.C..",
+      "reference": null,
+      "side_to_move": 0
+    },
+    {
+      "id": "p0007",
+      "legal_moves": 36,
+      "phase": "opening",
+      "pieces": 4,
+      "qfen": "A.../b.../..../.Ba.",
+      "reference": null,
+      "side_to_move": 0
+    },
+    {
+      "id": "p0008",
+      "legal_moves": 22,
+      "phase": "early_mid",
+      "pieces": 5,
+      "qfen": "...c/..BB/c.A./....",
+      "reference": null,
+      "side_to_move": 1
+    },
+    {
+      "id": "p0009",
+      "legal_moves": 19,
+      "phase": "early_mid",
+      "pieces": 7,
+      "qfen": "..c./CA.B/..c./Cd..",
+      "reference": null,
+      "side_to_move": 1
+    },
+    {
+      "id": "p0010",
+      "legal_moves": 9,
+      "phase": "early_mid",
+      "pieces": 7,
+      "qfen": "A.B./..a./.B../cc.D",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 32020,
+        "optimal_moves": [
+          "1:3:8"
+        ],
+        "pv": [
+          "1:3:8",
+          "0:3:1",
+          "1:1:4"
+        ],
+        "solve_time_s": 7.959543,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 1
+    },
+    {
+      "id": "p0011",
+      "legal_moves": 17,
+      "phase": "early_mid",
+      "pieces": 6,
+      "qfen": "CC../d.a./..../A.b.",
+      "reference": null,
+      "side_to_move": 0
+    },
+    {
+      "id": "p0012",
+      "legal_moves": 18,
+      "phase": "early_mid",
+      "pieces": 7,
+      "qfen": ".d../..b./d.CB/.BD.",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 55224,
+        "optimal_moves": [
+          "1:0:15",
+          "1:0:2",
+          "1:0:9"
+        ],
+        "pv": [
+          "1:0:15"
+        ],
+        "solve_time_s": 19.275003,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 1
+    },
+    {
+      "id": "p0013",
+      "legal_moves": 31,
+      "phase": "early_mid",
+      "pieces": 5,
+      "qfen": "..../Cb.C/D.../.c..",
+      "reference": null,
+      "side_to_move": 1
+    },
+    {
+      "id": "p0014",
+      "legal_moves": 22,
+      "phase": "early_mid",
+      "pieces": 7,
+      "qfen": ".DCD/b.../c.d./...C",
+      "reference": null,
+      "side_to_move": 1
+    },
+    {
+      "id": "p0015",
+      "legal_moves": 31,
+      "phase": "early_mid",
+      "pieces": 5,
+      "qfen": "..cA/..d./.B.B/....",
+      "reference": null,
+      "side_to_move": 1
+    },
+    {
+      "id": "p0016",
+      "legal_moves": 6,
+      "phase": "late_mid",
+      "pieces": 9,
+      "qfen": "...d/CAb./DbD./a..C",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 696,
+        "optimal_moves": [
+          "1:3:7"
+        ],
+        "pv": [
+          "1:3:7"
+        ],
+        "solve_time_s": 0.139274,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 1
+    },
+    {
+      "id": "p0017",
+      "legal_moves": 16,
+      "phase": "late_mid",
+      "pieces": 8,
+      "qfen": "c.b./c.../B..C/aC.D",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 42442,
+        "optimal_moves": [
+          "0:3:9"
+        ],
+        "pv": [
+          "0:3:9"
+        ],
+        "solve_time_s": 17.46237,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 0
+    },
+    {
+      "id": "p0018",
+      "legal_moves": 9,
+      "phase": "late_mid",
+      "pieces": 10,
+      "qfen": ".cAB/ba../C.B./b.Da",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 454,
+        "optimal_moves": [
+          "0:2:11",
+          "0:2:6",
+          "0:3:0"
+        ],
+        "pv": [
+          "0:2:11"
+        ],
+        "solve_time_s": 0.089531,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 0
+    },
+    {
+      "id": "p0019",
+      "legal_moves": 6,
+      "phase": "late_mid",
+      "pieces": 10,
+      "qfen": "A.DA/bD../dba./..Cd",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 80,
+        "optimal_moves": [
+          "0:2:1",
+          "0:2:11",
+          "0:2:12"
+        ],
+        "pv": [
+          "0:2:1"
+        ],
+        "solve_time_s": 0.015507,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 0
+    },
+    {
+      "id": "p0020",
+      "legal_moves": 13,
+      "phase": "late_mid",
+      "pieces": 8,
+      "qfen": ".c../d.A./cd.B/B..C",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 2708,
+        "optimal_moves": [
+          "0:0:0",
+          "0:0:10",
+          "0:0:13"
+        ],
+        "pv": [
+          "0:0:0"
+        ],
+        "solve_time_s": 0.717574,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 0
+    },
+    {
+      "id": "p0021",
+      "legal_moves": 6,
+      "phase": "late_mid",
+      "pieces": 8,
+      "qfen": ".Cad/.B.C/..B./d.c.",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 2484,
+        "optimal_moves": [
+          "0:0:8"
+        ],
+        "pv": [
+          "0:0:8",
+          "1:0:15",
+          "0:0:4"
+        ],
+        "solve_time_s": 0.613892,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 0
+    },
+    {
+      "id": "p0022",
+      "legal_moves": 11,
+      "phase": "late_mid",
+      "pieces": 9,
+      "qfen": "c..B/dAC./c.B./b.C.",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 7564,
+        "optimal_moves": [
+          "1:0:2"
+        ],
+        "pv": [
+          "1:0:2",
+          "0:3:11",
+          "1:0:15"
+        ],
+        "solve_time_s": 2.139347,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 1
+    },
+    {
+      "id": "p0023",
+      "legal_moves": 11,
+      "phase": "late_mid",
+      "pieces": 9,
+      "qfen": "cBA./.acD/..../.dAC",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 5760,
+        "optimal_moves": [
+          "1:1:12"
+        ],
+        "pv": [
+          "1:1:12"
+        ],
+        "solve_time_s": 1.939106,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 1
+    },
+    {
+      "id": "p0024",
+      "legal_moves": 13,
+      "phase": "late_mid",
+      "pieces": 9,
+      "qfen": "cD.a/B.d./.Ad./AD..",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 10689,
+        "optimal_moves": [
+          "1:1:2"
+        ],
+        "pv": [
+          "1:1:2"
+        ],
+        "solve_time_s": 2.886126,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 1
+    },
+    {
+      "id": "p0025",
+      "legal_moves": 15,
+      "phase": "late_mid",
+      "pieces": 8,
+      "qfen": "cdA./.d../..CC/.bD.",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 32087,
+        "optimal_moves": [
+          "0:1:3",
+          "0:1:6"
+        ],
+        "pv": [
+          "0:1:3"
+        ],
+        "solve_time_s": 11.696348,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 0
+    },
+    {
+      "id": "p0026",
+      "legal_moves": 8,
+      "phase": "late_mid",
+      "pieces": 9,
+      "qfen": "DB../.C.d/c.bd/.A.C",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 3696,
+        "optimal_moves": [
+          "1:0:4"
+        ],
+        "pv": [
+          "1:0:4"
+        ],
+        "solve_time_s": 1.018935,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 1
+    },
+    {
+      "id": "p0027",
+      "legal_moves": 6,
+      "phase": "late_mid",
+      "pieces": 9,
+      "qfen": ".c.d/cB../DB../.AAb",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 2434,
+        "optimal_moves": [
+          "1:0:0",
+          "1:1:2",
+          "1:3:6"
+        ],
+        "pv": [
+          "1:0:0",
+          "0:3:10",
+          "1:1:2"
+        ],
+        "solve_time_s": 0.625307,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 1
+    },
+    {
+      "id": "p0028",
+      "legal_moves": 5,
+      "phase": "endgame",
+      "pieces": 12,
+      "qfen": ".b.C/dc.A/BaDD/daB.",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 0,
+        "optimal_moves": [
+          "0:0:0",
+          "0:0:2",
+          "0:0:6",
+          "0:2:15",
+          "0:2:2"
+        ],
+        "pv": [
+          "0:0:0"
+        ],
+        "solve_time_s": 0.000337,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 0
+    },
+    {
+      "id": "p0029",
+      "legal_moves": 3,
+      "phase": "endgame",
+      "pieces": 12,
+      "qfen": "cac./D.AB/Badd/.CA.",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 0,
+        "optimal_moves": [
+          "0:2:15",
+          "0:3:12",
+          "0:3:5"
+        ],
+        "pv": [
+          "0:2:15"
+        ],
+        "solve_time_s": 0.000175,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 0
+    },
+    {
+      "id": "p0030",
+      "legal_moves": 1,
+      "phase": "endgame",
+      "pieces": 13,
+      "qfen": "ABD./B.AC/ccbb/.aDa",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 0,
+        "optimal_moves": [
+          "1:3:5"
+        ],
+        "pv": [
+          "1:3:5"
+        ],
+        "solve_time_s": 4.7e-05,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 1
+    },
+    {
+      "id": "p0031",
+      "legal_moves": 2,
+      "phase": "endgame",
+      "pieces": 12,
+      "qfen": "bdbC/cc.D/.B.C/Ad.A",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 16,
+        "optimal_moves": [
+          "0:3:6"
+        ],
+        "pv": [
+          "0:3:6"
+        ],
+        "solve_time_s": 0.002811,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 0
+    },
+    {
+      "id": "p0032",
+      "legal_moves": 2,
+      "phase": "endgame",
+      "pieces": 12,
+      "qfen": "dd.B/ABc./.CDC/b.aa",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 31,
+        "optimal_moves": [
+          "0:3:7"
+        ],
+        "pv": [
+          "0:3:7"
+        ],
+        "solve_time_s": 0.006024,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 0
+    },
+    {
+      "id": "p0033",
+      "legal_moves": 1,
+      "phase": "endgame",
+      "pieces": 12,
+      "qfen": "DcA./B.AC/.abb/ac.D",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 0,
+        "optimal_moves": [
+          "0:1:5"
+        ],
+        "pv": [
+          "0:1:5"
+        ],
+        "solve_time_s": 0.000118,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 0
+    },
+    {
+      "id": "p0034",
+      "legal_moves": 1,
+      "phase": "endgame",
+      "pieces": 13,
+      "qfen": "BCCd/BDA./abb./d.Ac",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 0,
+        "optimal_moves": [
+          "1:2:11"
+        ],
+        "pv": [
+          "1:2:11"
+        ],
+        "solve_time_s": 0.000114,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 1
+    },
+    {
+      "id": "p0035",
+      "legal_moves": 1,
+      "phase": "endgame",
+      "pieces": 13,
+      "qfen": "Dc.B/aaDB/..CA/cbbA",
+      "reference": {
+        "no_cutoff": true,
+        "nodes": 0,
+        "optimal_moves": [
+          "1:3:9"
+        ],
+        "pv": [
+          "1:3:9"
+        ],
+        "solve_time_s": 4.5e-05,
+        "solved": true,
+        "solver": "MinimaxEngine(max_depth=16, budget_s=30.0) quantik-core 1.0.0",
+        "value": 1
+      },
+      "side_to_move": 1
+    }
+  ],
+  "requested": {
+    "early_mid": 8,
+    "endgame": 8,
+    "late_mid": 12,
+    "opening": 8
+  },
+  "schema_version": 1,
+  "seed": 20260711
+}
