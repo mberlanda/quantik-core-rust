@@ -4,6 +4,7 @@ pub mod constants;
 pub mod evaluation;
 pub mod game;
 pub mod mcts;
+pub mod minimax;
 pub mod moves;
 pub mod opening_book;
 pub mod qfen;
