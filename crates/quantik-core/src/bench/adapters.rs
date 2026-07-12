@@ -91,7 +91,11 @@ pub struct RawMetrics {
 }
 
 /// Uniform interface over the benchmarked engines.
-pub trait EngineAdapter {
+///
+/// `Send + Sync` supertrait bounds let `run_agreement`/`run_head_to_head`
+/// share adapter references across a rayon worker pool when `workers > 1`;
+/// every adapter is a stateless value type, so the bounds are automatic.
+pub trait EngineAdapter: Send + Sync {
     fn name(&self) -> &'static str;
     fn stochastic(&self) -> bool;
     fn config_label(&self) -> String;

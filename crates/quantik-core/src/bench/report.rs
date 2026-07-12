@@ -181,7 +181,7 @@ pub fn render_markdown(bundle: &Value) -> String {
         })
         .collect();
 
-    let parts = vec![
+    let mut parts = vec![
         format!("# Cross-engine benchmark - `{short_sha}`"),
         String::new(),
         format!("- benchmark family: **{family}** ({})", family_note(family)),
@@ -204,6 +204,25 @@ pub fn render_markdown(bundle: &Value) -> String {
             "- started: {}",
             bundle["started_at"].as_str().unwrap_or("?")
         ),
+    ];
+
+    if let Some(checkpoint) = bundle.get("checkpoint").filter(|c| !c.is_null()) {
+        let counts = &checkpoint["counts"];
+        parts.push(format!(
+            "- checkpoint status: {}",
+            checkpoint["status"].as_str().unwrap_or("unknown")
+        ));
+        parts.push(format!(
+            "- checkpoint counts: observations {}, h2h_records {}",
+            counts["observations"].as_u64().unwrap_or(0),
+            counts["h2h_records"].as_u64().unwrap_or(0)
+        ));
+        if let Some(pairs) = checkpoint.get("h2h_pairs").filter(|p| !p.is_null()) {
+            parts.push(format!("- checkpoint h2h pairs: {pairs}"));
+        }
+    }
+
+    parts.extend([
         String::new(),
         "## Exact move agreement".into(),
         String::new(),
@@ -309,7 +328,7 @@ pub fn render_markdown(bundle: &Value) -> String {
          tables support fair engine-vs-engine claims."
             .into(),
         String::new(),
-    ];
+    ]);
     parts.join("\n")
 }
 
@@ -388,6 +407,21 @@ mod tests {
         assert!(markdown.contains("benchmark family: **fixed**"));
         // Null memory renders as "-".
         assert!(markdown.contains("| 1234 | - |"));
+    }
+
+    #[test]
+    fn checkpoint_block_renders_after_started_line_when_present() {
+        let mut bundle = minimal_bundle();
+        bundle["checkpoint"] = json!({
+            "status": "running",
+            "counts": {"observations": 5, "h2h_records": 2},
+        });
+        let markdown = render_markdown(&bundle);
+        assert!(markdown.contains("- checkpoint status: running"));
+        assert!(markdown.contains("- checkpoint counts: observations 5, h2h_records 2"));
+        // No checkpoint block: report renders unaffected.
+        let no_checkpoint = render_markdown(&minimal_bundle());
+        assert!(!no_checkpoint.contains("checkpoint status"));
     }
 
     #[test]

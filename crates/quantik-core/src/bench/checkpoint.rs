@@ -1,293 +1,749 @@
-//! Crash-safe checkpoint/resume for benchmark `run` (beyond the Python
-//! harness, which has no checkpointing).
+//! Directory-based resumable checkpoint storage for long benchmark runs.
 //!
-//! The checkpoint file is JSON Lines: a header line identifying which
-//! dataset and run configuration it belongs to, followed by one line per
-//! completed observation row or head-to-head record. Every line is flushed
-//! to the OS individually (crash-safe against process death — Ctrl-C,
-//! panic, kill; not fsync'd against power loss), so a crash loses at most
-//! the line in flight, and the loader tolerates a truncated tail —
-//! everything written before it is intact and reloadable.
+//! Port of `benchmarks/checkpoint.py`. A checkpoint is a directory:
 //!
 //! ```text
-//! {"kind":"header","dataset_checksum":"...","config_fingerprint":"..."}
-//! {"kind":"observation","row":{...}}
-//! {"kind":"h2h","record":{...}}
+//! <checkpoint-dir>/
+//!   manifest.json      pretty (indent 2), sorted-key JSON + trailing "\n",
+//!                       written atomically (tmp file + rename)
+//!   observations.jsonl one compact, sorted-key JSON row per completed
+//!                       agreement observation, appended + flushed per line
+//!   h2h.jsonl           one compact, sorted-key JSON row per completed
+//!                       head-to-head game, appended + flushed per line
 //! ```
 //!
-//! `config_fingerprint` is a sha256 over the canonical JSON of the run
-//! config with `output`/`checkpoint` stripped, so resuming with the same
-//! engine settings but a different `--output` (or `--checkpoint`) path still
-//! matches. A checkpoint whose header doesn't match the current run's
-//! dataset checksum or config fingerprint is refused outright — runs are
-//! never silently mixed.
+//! Both JSONL files use [`crate::bench::canonical::canonical_json`], the
+//! same byte-exact encoder used for dataset/bundle artifacts, so a
+//! checkpoint directory written by this crate loads and rehydrates
+//! (`bundle_from_checkpoint`) correctly in Python's `benchmarks.checkpoint`
+//! module and vice versa. `manifest.json` uses
+//! [`crate::bench::canonical::canonical_json_pretty`], matching Python's
+//! `json.dumps(manifest, indent=2, sort_keys=True) + "\n"`.
+//!
+//! **Resume validation is intra-language only.** `validate_resume_manifest`
+//! compares the run's config dict against the manifest's stored config
+//! dict, but the two languages' CLI argument dicts have different key sets
+//! and shapes (e.g. `track_memory`/`skip_agreement` exist only in the
+//! Python CLI) — a checkpoint directory started by one language's `run` is
+//! not expected to `--resume` cleanly in the other. Loading and reporting
+//! (`bundle_from_checkpoint`, `report --input <dir>`) work identically in
+//! both languages regardless of which one wrote the directory.
+//!
+//! Unlike the single-file `.ckpt` format this module replaces (PR #10),
+//! an invalid JSONL line is a hard error (file path + 1-based line
+//! number) — there is no truncated-tail tolerance here, because
+//! `manifest.json`'s atomic tmp+rename write is the integrity anchor: a
+//! crash mid-write of an observation/h2h line can only ever leave a
+//! trailing partial line (never a torn manifest), and callers that always
+//! flush after `append_jsonl` should not see one in practice, but Python
+//! chose to raise rather than silently drop, so this port matches that.
 
-use crate::bench::agreement::{row_key, RunKey};
-use crate::bench::canonical::canonical_json;
-use crate::bench::head_to_head::{record_key, GameKey};
-use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use std::path::Path;
+use crate::bench::agreement::{aggregate_agreement, aggregate_cost};
+use crate::bench::bundle;
+use crate::bench::canonical::{canonical_json, canonical_json_pretty};
+use crate::bench::head_to_head;
+use crate::bench::stability::aggregate_stability;
+use serde_json::{json, Map, Value};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
-/// sha256 (hex) of the canonical JSON of a run config, excluding the
-/// `output` and `checkpoint` fields (so those may differ across a
-/// checkpoint/resume pair without invalidating it).
-pub fn config_fingerprint(config: &Value) -> String {
-    let mut stripped = config.as_object().cloned().unwrap_or_default();
-    stripped.remove("output");
-    stripped.remove("checkpoint");
-    let blob = canonical_json(&Value::Object(stripped));
-    let mut hasher = Sha256::new();
-    hasher.update(blob.as_bytes());
-    format!("{:x}", hasher.finalize())
+pub const MANIFEST: &str = "manifest.json";
+pub const OBSERVATIONS: &str = "observations.jsonl";
+pub const H2H_RECORDS: &str = "h2h.jsonl";
+
+/// Config fields dropped from the resume signature: they legitimately
+/// differ between the interrupted run and the resuming one (or, for
+/// `checkpoint_dir`/`workers`, don't describe the *engine* configuration
+/// at all). Matches Python's `checkpoint._RESUME_CONFIG_EXCLUDES` exactly
+/// (five keys — the plan text lists four, but the Python source, which is
+/// authoritative, has five).
+const RESUME_CONFIG_EXCLUDES: [&str; 5] = [
+    "checkpoint_dir",
+    "output",
+    "resume",
+    "skip_agreement",
+    "workers",
+];
+
+/// The paths that make up one checkpoint directory.
+#[derive(Debug, Clone)]
+pub struct CheckpointPaths {
+    pub root: PathBuf,
+    pub manifest: PathBuf,
+    pub observations: PathBuf,
+    pub h2h: PathBuf,
 }
 
-/// Rows/records recovered from a checkpoint, plus the skip sets derived
-/// from them so a resumed run doesn't repeat completed work.
-#[derive(Debug, Default)]
-pub struct CheckpointState {
-    pub rows: Vec<Value>,
-    pub records: Vec<Value>,
-    pub row_skip: HashSet<RunKey>,
-    pub record_skip: HashSet<GameKey>,
+/// Resolve the manifest/observations/h2h file paths under `root`.
+pub fn checkpoint_paths(root: &Path) -> CheckpointPaths {
+    CheckpointPaths {
+        root: root.to_path_buf(),
+        manifest: root.join(MANIFEST),
+        observations: root.join(OBSERVATIONS),
+        h2h: root.join(H2H_RECORDS),
+    }
 }
 
-/// Parsed checkpoint contents: the header, the (kind-tagged) body lines,
-/// and the byte length of the file up to and including the last line that
-/// parsed successfully. A truncated final line (partial write from a
-/// crash) is excluded from both `entries` and `valid_len`.
-///
-/// `ends_with_newline` is false when the kept region's final line parsed
-/// as valid JSON but its trailing `\n` was lost (a crash can persist the
-/// bytes of a line without its newline); appending directly after such a
-/// line would merge two records into one corrupt line, so
-/// [`CheckpointWriter::resume`] must restore the newline first.
-struct ParsedCheckpoint {
-    header: Value,
-    entries: Vec<Value>,
-    valid_len: u64,
-    ends_with_newline: bool,
+/// Resolve a manifest target from either a checkpoint root directory or a
+/// direct path to (or already ending in) `manifest.json` — mirrors
+/// Python's `_manifest_path` so `write_manifest`/`load_manifest` accept
+/// either form.
+fn manifest_path(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        return path.join(MANIFEST);
+    }
+    let name_is_manifest = path.file_name().is_some_and(|n| n == MANIFEST);
+    let has_json_suffix = path.extension().is_some_and(|e| e == "json");
+    if !name_is_manifest && !has_json_suffix {
+        return path.join(MANIFEST);
+    }
+    path.to_path_buf()
 }
 
-fn parse_checkpoint_file(path: &Path) -> Result<ParsedCheckpoint, String> {
+/// Append one JSON object as one compact, sorted-key JSONL row, flushing to
+/// the OS immediately.
+pub fn append_jsonl(path: &Path, row: &Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {parent:?}: {e}"))?;
+        }
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("open {path:?}: {e}"))?;
+    writeln!(file, "{}", canonical_json(row)).map_err(|e| format!("write {path:?}: {e}"))?;
+    file.flush().map_err(|e| format!("flush {path:?}: {e}"))
+}
+
+/// Load a JSONL file; a missing file behaves like an empty stream. Blank
+/// lines are skipped. An invalid line is a hard error naming the file and
+/// its 1-based line number (no truncated-tail tolerance — see the module
+/// doc).
+pub fn load_jsonl(path: &Path) -> Result<Vec<Value>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
     let text = std::fs::read_to_string(path).map_err(|e| format!("read {path:?}: {e}"))?;
-    let chunks: Vec<&str> = text.split_inclusive('\n').collect();
-    let last_index = chunks.len().saturating_sub(1);
-
-    let mut offset: u64 = 0;
-    let mut valid_len: u64 = 0;
-    let mut header: Option<Value> = None;
-    let mut entries = Vec::new();
-
-    for (i, chunk) in chunks.iter().enumerate() {
-        offset += chunk.len() as u64;
-        let line = chunk.trim_end_matches('\n');
-        if line.trim().is_empty() {
-            valid_len = offset;
+    let mut rows = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        let parsed: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) if i == last_index => break, // tolerate a truncated tail line
-            Err(e) => return Err(format!("corrupt checkpoint line {}: {e}", i + 1)),
-        };
-        if header.is_none() {
-            if parsed["kind"] != json!("header") {
-                return Err("checkpoint file is missing its header line".into());
-            }
-            header = Some(parsed);
-        } else {
-            entries.push(parsed);
-        }
-        valid_len = offset;
+        let value: Value = serde_json::from_str(trimmed)
+            .map_err(|e| format!("{}:{}: invalid checkpoint JSON: {e}", path.display(), i + 1))?;
+        rows.push(value);
     }
+    Ok(rows)
+}
 
-    let header = header.ok_or("checkpoint file is empty or missing its header line")?;
-    let ends_with_newline = valid_len == 0 || text.as_bytes()[valid_len as usize - 1] == b'\n';
-    Ok(ParsedCheckpoint {
-        header,
-        entries,
-        valid_len,
-        ends_with_newline,
+/// Build the set of stable resume keys already present in checkpoint rows.
+pub fn key_set<K: Eq + std::hash::Hash>(
+    rows: &[Value],
+    key_func: impl Fn(&Value) -> K,
+) -> HashSet<K> {
+    rows.iter().map(key_func).collect()
+}
+
+/// Atomically write the checkpoint manifest (tmp file + rename), pretty
+/// (indent 2), sorted-key JSON + trailing newline, matching Python's
+/// `json.dumps(manifest, indent=2, sort_keys=True) + "\n"`.
+pub fn write_manifest(path: &Path, manifest: &Value) -> Result<(), String> {
+    let target = manifest_path(path);
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {parent:?}: {e}"))?;
+        }
+    }
+    let file_name = target
+        .file_name()
+        .ok_or("manifest path has no file name")?
+        .to_string_lossy()
+        .to_string();
+    let tmp = target.with_file_name(format!("{file_name}.tmp"));
+    std::fs::write(&tmp, canonical_json_pretty(manifest))
+        .map_err(|e| format!("write {tmp:?}: {e}"))?;
+    std::fs::rename(&tmp, &target).map_err(|e| format!("rename {tmp:?} -> {target:?}: {e}"))
+}
+
+/// Load the checkpoint manifest, or an empty object if it doesn't exist
+/// yet (mirrors Python's `load_manifest` returning `{}`).
+pub fn load_manifest(path: &Path) -> Result<Value, String> {
+    let target = manifest_path(path);
+    if !target.exists() {
+        return Ok(json!({}));
+    }
+    let text = std::fs::read_to_string(&target).map_err(|e| format!("read {target:?}: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("parse {target:?}: {e}"))
+}
+
+fn now_timestamp() -> String {
+    chrono::Local::now()
+        .format("%Y-%m-%dT%H:%M:%S%z")
+        .to_string()
+}
+
+/// Update checkpoint progress counters in place (`counts`, optionally
+/// `status`, always `updated_at`) and return the resulting manifest.
+pub fn update_manifest_counts(
+    path: &Path,
+    observations: u64,
+    h2h_records: u64,
+    status: Option<&str>,
+) -> Result<Value, String> {
+    let target = manifest_path(path);
+    let mut manifest = load_manifest(&target)?;
+    manifest["counts"] = json!({"observations": observations, "h2h_records": h2h_records});
+    if let Some(status) = status {
+        manifest["status"] = json!(status);
+    }
+    manifest["updated_at"] = json!(now_timestamp());
+    write_manifest(&target, &manifest)?;
+    Ok(manifest)
+}
+
+/// Drop volatile fields that must not participate in resume validation.
+pub fn normalize_run_config(config: &Value) -> Value {
+    let mut map = config.as_object().cloned().unwrap_or_default();
+    for key in RESUME_CONFIG_EXCLUDES {
+        map.remove(key);
+    }
+    Value::Object(map)
+}
+
+fn config_signature(config: &Value, ignore_skip_h2h: bool) -> Value {
+    let mut signature = normalize_run_config(config);
+    if ignore_skip_h2h {
+        if let Some(map) = signature.as_object_mut() {
+            map.remove("skip_h2h");
+        }
+    }
+    signature
+}
+
+/// Build a fresh checkpoint manifest (mirrors Python CLI's
+/// `_checkpoint_manifest` in `examples/cross_engine_benchmark.py`, not the
+/// library-level `_build_manifest` in `benchmarks/checkpoint.py` — the CLI
+/// manifest intentionally omits `schema_version`; that key only lives on
+/// the bundle produced by `bundle_from_checkpoint`, from the
+/// `bundle::SCHEMA_VERSION` constant).
+pub fn build_manifest(
+    config: &Value,
+    dataset_payload: &Value,
+    status: &str,
+    observations: u64,
+    h2h_records: u64,
+) -> Value {
+    let positions = dataset_payload["positions"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut phases: Map<String, Value> = Map::new();
+    for position in &positions {
+        let phase = position["phase"].as_str().unwrap_or_default().to_string();
+        let count = phases.get(&phase).and_then(Value::as_u64).unwrap_or(0);
+        phases.insert(phase, json!(count + 1));
+    }
+    json!({
+        "started_at": now_timestamp(),
+        "environment": bundle::collect_environment(),
+        "config": config,
+        "dataset": {
+            "checksum": dataset_payload.get("checksum").cloned().unwrap_or(Value::Null),
+            "generator": dataset_payload["generator"],
+            "seed": dataset_payload["seed"],
+            "schema_version": dataset_payload["schema_version"],
+            "positions": positions.len(),
+            "phases": phases,
+        },
+        "status": status,
+        "counts": {"observations": observations, "h2h_records": h2h_records},
     })
 }
 
-/// Load and validate a checkpoint file, returning the completed
-/// observation rows and head-to-head records plus their skip sets.
-///
-/// The header's `dataset_checksum` and `config_fingerprint` must match the
-/// current run exactly; a mismatch is an error (never silently mixed
-/// runs). A truncated trailing line (a crash mid-write of the last entry)
-/// is tolerated and simply dropped.
-pub fn load_checkpoint(
-    path: &Path,
-    expected_checksum: &str,
-    expected_fingerprint: &str,
-) -> Result<CheckpointState, String> {
-    let parsed = parse_checkpoint_file(path)?;
-    let checksum = parsed.header["dataset_checksum"].as_str().unwrap_or("");
-    let fingerprint = parsed.header["config_fingerprint"].as_str().unwrap_or("");
-    if checksum != expected_checksum {
+/// Raise a clear error when a resume checkpoint does not match this run:
+/// dataset checksum must be equal, and the normalized config signature
+/// must be equal (per-key diff in the error message otherwise).
+/// `allow_skip_h2h_mismatch` additionally drops `skip_h2h` from the
+/// signature — the CLI only sets this when the checkpoint's existing h2h
+/// records already equal the expected count, so a differing `--skip-h2h`
+/// this run genuinely doesn't matter.
+pub fn validate_resume_manifest(
+    manifest: &Value,
+    dataset_checksum: Option<&str>,
+    config: &Value,
+    allow_skip_h2h_mismatch: bool,
+) -> Result<(), String> {
+    let manifest_dataset = manifest.get("dataset").cloned().unwrap_or(json!({}));
+    let actual_checksum = manifest_dataset.get("checksum").and_then(Value::as_str);
+    if actual_checksum != dataset_checksum {
         return Err(format!(
-            "checkpoint dataset checksum mismatch: file has {checksum:?}, this run expects \
-             {expected_checksum:?} (different --dataset?); refusing to mix runs"
-        ));
-    }
-    if fingerprint != expected_fingerprint {
-        return Err(format!(
-            "checkpoint config fingerprint mismatch: file has {fingerprint:?}, this run expects \
-             {expected_fingerprint:?} (engine settings changed?); refusing to mix runs"
+            "checkpoint dataset checksum mismatch: expected {dataset_checksum:?}, found {actual_checksum:?}"
         ));
     }
 
-    let mut state = CheckpointState::default();
-    for entry in parsed.entries {
-        match entry["kind"].as_str() {
-            Some("observation") => {
-                let row = entry["row"].clone();
-                state.row_skip.insert(row_key(&row));
-                state.rows.push(row);
+    let expected_config = config_signature(config, allow_skip_h2h_mismatch);
+    let empty = Value::Null;
+    let actual_config = config_signature(
+        manifest.get("config").unwrap_or(&empty),
+        allow_skip_h2h_mismatch,
+    );
+    if actual_config != expected_config {
+        let expected_map = expected_config.as_object().cloned().unwrap_or_default();
+        let actual_map = actual_config.as_object().cloned().unwrap_or_default();
+        let mut keys: BTreeSet<String> = expected_map.keys().cloned().collect();
+        keys.extend(actual_map.keys().cloned());
+        let mut diffs = Vec::new();
+        for key in keys {
+            let expected_value = expected_map.get(&key).cloned().unwrap_or(Value::Null);
+            let actual_value = actual_map.get(&key).cloned().unwrap_or(Value::Null);
+            if expected_value != actual_value {
+                diffs.push(format!(
+                    "{key}: expected {expected_value}, found {actual_value}"
+                ));
             }
-            Some("h2h") => {
-                let record = entry["record"].clone();
-                state.record_skip.insert(record_key(&record));
-                state.records.push(record);
-            }
-            other => return Err(format!("unknown checkpoint entry kind: {other:?}")),
         }
+        let detail = if diffs.is_empty() {
+            "unknown difference".to_string()
+        } else {
+            diffs.join("; ")
+        };
+        return Err(format!("checkpoint config mismatch: {detail}"));
     }
-    Ok(state)
+    Ok(())
 }
 
-/// Appends JSON Lines to a checkpoint file, flushing to the OS after every
-/// line so a process crash loses at most the line currently being written
-/// (not fsync'd, so power loss can lose more — the loader tolerates a
-/// truncated tail either way).
-#[derive(Debug)]
-pub struct CheckpointWriter {
-    file: BufWriter<File>,
+fn dataset_summary(manifest: &Value) -> Result<Value, String> {
+    match manifest.get("dataset") {
+        Some(d) if !d.is_null() => Ok(d.clone()),
+        _ => Err("checkpoint manifest is missing dataset metadata".into()),
+    }
 }
 
-impl CheckpointWriter {
-    /// Start a brand-new checkpoint and write its header line. Refuses if
-    /// the file already exists — callers must pass `--resume` or delete it
-    /// first, so a fresh run never silently clobbers completed work.
-    pub fn create(
-        path: &Path,
-        dataset_checksum: &str,
-        config_fingerprint: &str,
-    ) -> Result<Self, String> {
-        if path.exists() {
-            return Err(format!(
-                "checkpoint file already exists at {}; pass --resume to continue it, or delete \
-                 it to start a fresh run",
-                path.display()
-            ));
-        }
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {parent:?}: {e}"))?;
-            }
-        }
-        let file = File::create(path).map_err(|e| format!("create {path:?}: {e}"))?;
-        let mut writer = CheckpointWriter {
-            file: BufWriter::new(file),
-        };
-        writer.write_line(&json!({
-            "kind": "header",
-            "dataset_checksum": dataset_checksum,
-            "config_fingerprint": config_fingerprint,
-        }))?;
-        Ok(writer)
+/// Group head-to-head records by unordered engine pair, in first-seen
+/// order, with each aggregate's `(engine_a, engine_b)` naming taken from
+/// that pair's first record's `(mover, responder)` — mirrors Python's
+/// `_head_to_head_aggregates`.
+fn head_to_head_aggregates(records: &[Value]) -> Vec<Value> {
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut names: HashMap<(String, String), (String, String)> = HashMap::new();
+    let mut groups: HashMap<(String, String), Vec<Value>> = HashMap::new();
+
+    for record in records {
+        let mover = record["mover"].as_str().unwrap_or_default().to_string();
+        let responder = record["responder"].as_str().unwrap_or_default().to_string();
+        let mut sorted_pair = [mover.clone(), responder.clone()];
+        sorted_pair.sort();
+        let pair_key = (sorted_pair[0].clone(), sorted_pair[1].clone());
+
+        groups
+            .entry(pair_key.clone())
+            .or_insert_with(|| {
+                order.push(pair_key.clone());
+                names.insert(pair_key.clone(), (mover.clone(), responder.clone()));
+                Vec::new()
+            })
+            .push(record.clone());
     }
 
-    /// Reopen an already-validated checkpoint (see [`load_checkpoint`]) for
-    /// appending. Any truncated trailing line left by a prior crash is
-    /// dropped first, and if the last kept line is valid JSON that lost
-    /// only its trailing newline, the newline is restored — so the file
-    /// only ever holds complete, newline-terminated lines before new
-    /// writes resume.
-    pub fn resume(path: &Path) -> Result<Self, String> {
-        let parsed = parse_checkpoint_file(path)?;
-        {
-            let truncator = std::fs::OpenOptions::new()
-                .write(true)
-                .open(path)
-                .map_err(|e| format!("open {path:?}: {e}"))?;
-            truncator
-                .set_len(parsed.valid_len)
-                .map_err(|e| format!("truncate {path:?}: {e}"))?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(path)
-            .map_err(|e| format!("open {path:?}: {e}"))?;
-        let mut writer = CheckpointWriter {
-            file: BufWriter::new(file),
-        };
-        if !parsed.ends_with_newline {
-            // A crash can persist a complete final line but drop its
-            // newline; appending straight after it would merge two records
-            // into one corrupt line and break the *next* resume.
-            writer
-                .file
-                .write_all(b"\n")
-                .and_then(|()| writer.file.flush())
-                .map_err(|e| format!("repair {path:?}: {e}"))?;
-        }
-        Ok(writer)
+    order
+        .into_iter()
+        .map(|pair_key| {
+            let (name_a, name_b) = names[&pair_key].clone();
+            head_to_head::aggregate_head_to_head(&groups[&pair_key], &name_a, &name_b)
+        })
+        .collect()
+}
+
+/// Rehydrate a checkpoint directory into the standard benchmark bundle,
+/// including a partial state — an in-progress or preflight-failed
+/// checkpoint rehydrates fine, with whatever rows/records/aggregates are
+/// available so far. The bundle gains a `"checkpoint": {status, counts}`
+/// block (and `h2h_pairs` when the manifest carries one).
+pub fn bundle_from_checkpoint(root: &Path) -> Result<Value, String> {
+    let paths = checkpoint_paths(root);
+    let manifest = load_manifest(&paths.manifest)?;
+    let observations = load_jsonl(&paths.observations)?;
+    let records = load_jsonl(&paths.h2h)?;
+    let dataset = dataset_summary(&manifest)?;
+
+    let counts = manifest
+        .get("counts")
+        .cloned()
+        .unwrap_or(json!({"observations": 0, "h2h_records": 0}));
+    let mut checkpoint_info = json!({
+        "status": manifest.get("status").and_then(Value::as_str).unwrap_or("unknown"),
+        "counts": counts,
+    });
+    if let Some(pairs) = manifest.get("h2h_pairs") {
+        checkpoint_info["h2h_pairs"] = pairs.clone();
     }
 
-    fn write_line(&mut self, value: &Value) -> Result<(), String> {
-        let line = serde_json::to_string(value).map_err(|e| format!("serialize: {e}"))?;
-        writeln!(self.file, "{line}").map_err(|e| format!("write checkpoint: {e}"))?;
-        self.file
-            .flush()
-            .map_err(|e| format!("flush checkpoint: {e}"))
-    }
+    let started_at = manifest
+        .get("started_at")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(now_timestamp);
+    let environment = manifest
+        .get("environment")
+        .cloned()
+        .unwrap_or_else(bundle::collect_environment);
+    let config = manifest.get("config").cloned().unwrap_or(json!({}));
 
-    /// Record one completed observation row (checkpoint hook for
-    /// `run_agreement`'s `on_row` callback).
-    pub fn write_row(&mut self, row: &Value) -> Result<(), String> {
-        self.write_line(&json!({"kind": "observation", "row": row}))
-    }
-
-    /// Record one completed head-to-head record (checkpoint hook for
-    /// `run_head_to_head`'s `on_record` callback).
-    pub fn write_record(&mut self, record: &Value) -> Result<(), String> {
-        self.write_line(&json!({"kind": "h2h", "record": record}))
-    }
+    Ok(json!({
+        "schema_version": bundle::SCHEMA_VERSION,
+        "started_at": started_at,
+        "environment": environment,
+        "config": config,
+        "dataset": dataset,
+        "checkpoint": checkpoint_info,
+        "observations": observations,
+        "head_to_head": {
+            "records": records,
+            "aggregates": head_to_head_aggregates(&records),
+        },
+        "aggregates": {
+            "agreement": aggregate_agreement(&observations),
+            "cost": aggregate_cost(&observations),
+            "stability": aggregate_stability(&observations),
+        },
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bench::adapters::{EngineAdapter, MinimaxAdapter, RandomAdapter};
-    use crate::bench::agreement::{self, run_agreement};
-    use crate::bitboard::Bitboard;
-    use crate::state::State;
-    use std::collections::BTreeSet;
+    use crate::bench::agreement::{observation_key, run_agreement, ObservationKey};
+    use crate::bench::head_to_head::h2h_key;
+    use crate::bench::report;
 
-    fn scratch_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("quantik-ckpt-{}-{tag}", std::process::id()));
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("quantik-ckpt-{}-{tag}-{id}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    fn two_position_payload() -> (Value, Value) {
-        let p0 = State::new(Bitboard::EMPTY).to_qfen();
-        let p1 = State::new(Bitboard::EMPTY.with_move(0, 0, 0)).to_qfen();
-        let full = json!({
-            "positions": [
-                {"id": "p0", "qfen": p0, "phase": "opening", "reference": Value::Null},
-                {"id": "p1", "qfen": p1, "phase": "opening", "reference": Value::Null},
-            ]
+    #[test]
+    fn jsonl_append_and_load_roundtrip() {
+        let dir = scratch_dir("jsonl-roundtrip");
+        let path = dir.join("rows.jsonl");
+        append_jsonl(&path, &json!({"b": 2, "a": 1})).unwrap();
+        append_jsonl(&path, &json!({"a": 3, "b": 4})).unwrap();
+
+        assert_eq!(
+            load_jsonl(&path).unwrap(),
+            vec![json!({"a": 1, "b": 2}), json!({"a": 3, "b": 4})]
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines, vec![r#"{"a":1,"b":2}"#, r#"{"a":3,"b":4}"#]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_jsonl_missing_file_returns_empty() {
+        let dir = scratch_dir("missing");
+        assert_eq!(
+            load_jsonl(&dir.join("missing.jsonl")).unwrap(),
+            Vec::<Value>::new()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_jsonl_bad_json_includes_file_and_line() {
+        let dir = scratch_dir("bad-json");
+        let path = dir.join("rows.jsonl");
+        std::fs::write(&path, "{\"ok\":1}\n{\"bad\":\n").unwrap();
+        let err = load_jsonl(&path).unwrap_err();
+        assert!(err.contains("rows.jsonl:2"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_jsonl_skips_blank_lines() {
+        let dir = scratch_dir("blank-lines");
+        let path = dir.join("rows.jsonl");
+        std::fs::write(&path, "{\"a\":1}\n\n   \n{\"a\":2}\n").unwrap();
+        assert_eq!(
+            load_jsonl(&path).unwrap(),
+            vec![json!({"a": 1}), json!({"a": 2})]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn observation_and_h2h_keys_are_stable() {
+        let observation = json!({
+            "position_id": "p0008",
+            "engine": "mcts",
+            "config_label": "mcts(it=5000,d=16,c=1.414)",
+            "seed": 7,
         });
-        let truncated = json!({"positions": [full["positions"][0].clone()]});
-        (full, truncated)
+        let h2h = json!({
+            "position_id": "p0008",
+            "mover": "beam",
+            "responder": "mcts",
+            "seed": 11,
+        });
+        assert_eq!(
+            observation_key(&observation),
+            (
+                "p0008".to_string(),
+                "mcts".to_string(),
+                "mcts(it=5000,d=16,c=1.414)".to_string(),
+                Some(7)
+            )
+        );
+        assert_eq!(
+            h2h_key(&h2h),
+            (
+                "p0008".to_string(),
+                "beam".to_string(),
+                "mcts".to_string(),
+                11
+            )
+        );
+        let set: HashSet<ObservationKey> =
+            key_set(std::slice::from_ref(&observation), observation_key);
+        assert!(set.contains(&(
+            "p0008".to_string(),
+            "mcts".to_string(),
+            "mcts(it=5000,d=16,c=1.414)".to_string(),
+            Some(7)
+        )));
+    }
+
+    #[test]
+    fn manifest_atomic_write_counts_and_status_transitions() {
+        let dir = scratch_dir("manifest-lifecycle");
+        let root = dir.join("checkpoint");
+        let config = json!({"family": "native", "engine_seeds": [0, 1]});
+        let dataset_payload = json!({
+            "checksum": "abc123",
+            "generator": "benchmarks.dataset.generate/v1",
+            "seed": 20260711,
+            "schema_version": 1,
+            "positions": [{"phase": "late_mid"}],
+        });
+        let manifest = build_manifest(&config, &dataset_payload, "running", 0, 0);
+        write_manifest(&root, &manifest).unwrap();
+        assert!(root.join(MANIFEST).exists());
+        // manifest.json.tmp must never be left behind after a successful write.
+        assert!(!root.join("manifest.json.tmp").exists());
+
+        let loaded = load_manifest(&root).unwrap();
+        assert_eq!(loaded["status"], json!("running"));
+        assert_eq!(loaded["dataset"]["checksum"], json!("abc123"));
+        assert_eq!(loaded["dataset"]["phases"]["late_mid"], json!(1));
+
+        let observation = json!({
+            "engine": "minimax", "config_label": "minimax(d=16)",
+            "position_id": "p0000", "move": "1:3:5", "seed": 0, "hit": true,
+            "wall_time_s": 0.01, "nodes": 42, "peak_memory_bytes": Value::Null,
+        });
+        let h2h_record = json!({
+            "position_id": "p0000", "phase": "late_mid",
+            "mover": "minimax", "responder": "random",
+            "winner": "minimax", "plies": 1, "seed": 0,
+        });
+        append_jsonl(&root.join(OBSERVATIONS), &observation).unwrap();
+        append_jsonl(&root.join(H2H_RECORDS), &h2h_record).unwrap();
+
+        let updated = update_manifest_counts(&root, 1, 1, Some("complete")).unwrap();
+        assert_eq!(updated["status"], json!("complete"));
+        assert_eq!(
+            updated["counts"],
+            json!({"observations": 1, "h2h_records": 1})
+        );
+        assert!(updated["updated_at"].is_string());
+
+        let bundle_dict = bundle_from_checkpoint(&root).unwrap();
+        assert_eq!(bundle_dict["schema_version"], json!(bundle::SCHEMA_VERSION));
+        assert_eq!(bundle_dict["config"], config);
+        assert_eq!(bundle_dict["observations"], json!([observation]));
+        assert_eq!(bundle_dict["head_to_head"]["records"], json!([h2h_record]));
+        assert_eq!(bundle_dict["aggregates"]["agreement"][0]["n"], json!(1));
+        assert_eq!(
+            bundle_dict["aggregates"]["cost"][0]["median_nodes"],
+            json!(42.0)
+        );
+        assert_eq!(
+            bundle_dict["head_to_head"]["aggregates"][0]["games"],
+            json!(1)
+        );
+        assert_eq!(bundle_dict["checkpoint"]["status"], json!("complete"));
+        assert_eq!(
+            bundle_dict["checkpoint"]["counts"],
+            json!({"observations": 1, "h2h_records": 1})
+        );
+        assert!(report::render_markdown(&bundle_dict).contains("checkpoint status: complete"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn running_checkpoint_bundle_and_report_show_partial_status() {
+        let dir = scratch_dir("partial-status");
+        let root = dir.join("checkpoint");
+        let dataset_payload = json!({
+            "schema_version": 1,
+            "generator": "benchmarks.dataset.generate/v1",
+            "seed": 20260711,
+            "checksum": "abc123",
+            "positions": [
+                {"id": "p0000", "qfen": ".ba./..CC/DcbD/cA.A", "phase": "late_mid",
+                 "pieces": 8, "side_to_move": 1, "legal_moves": 10, "reference": Value::Null},
+            ],
+        });
+        let manifest = build_manifest(
+            &json!({"family": "native", "engine_seeds": [0]}),
+            &dataset_payload,
+            "running",
+            0,
+            0,
+        );
+        write_manifest(&root, &manifest).unwrap();
+
+        let bundle_dict = bundle_from_checkpoint(&root).unwrap();
+        assert_eq!(bundle_dict["checkpoint"]["status"], json!("running"));
+        assert_eq!(
+            bundle_dict["checkpoint"]["counts"],
+            json!({"observations": 0, "h2h_records": 0})
+        );
+        assert_eq!(bundle_dict["observations"], json!([]));
+        assert!(report::render_markdown(&bundle_dict).contains("checkpoint status: running"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bundle_from_checkpoint_requires_dataset_metadata() {
+        let dir = scratch_dir("no-dataset");
+        let root = dir.join("checkpoint");
+        write_manifest(&root, &json!({"status": "running"})).unwrap();
+        let err = bundle_from_checkpoint(&root).unwrap_err();
+        assert!(err.contains("dataset metadata"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resume_validation_checksum_mismatch() {
+        let manifest = json!({"dataset": {"checksum": "a"}, "config": {}});
+        let err = validate_resume_manifest(&manifest, Some("b"), &json!({}), false).unwrap_err();
+        assert!(err.contains("checksum mismatch"), "{err}");
+    }
+
+    #[test]
+    fn resume_validation_config_diff_message_names_the_key() {
+        let manifest = json!({
+            "dataset": {"checksum": "a"},
+            "config": {"family": "fixed", "seeds": 10},
+        });
+        let err = validate_resume_manifest(
+            &manifest,
+            Some("a"),
+            &json!({"family": "fixed", "seeds": 30}),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("seeds: expected 30, found 10"), "{err}");
+    }
+
+    #[test]
+    fn resume_validation_excludes_volatile_fields() {
+        let manifest = json!({
+            "dataset": {"checksum": "a"},
+            "config": {
+                "family": "fixed", "checkpoint_dir": "old/dir",
+                "output": "old.json", "resume": false, "workers": 1,
+            },
+        });
+        // Only checkpoint_dir/output/resume/workers differ: excluded fields
+        // must not trip the mismatch.
+        validate_resume_manifest(
+            &manifest,
+            Some("a"),
+            &json!({
+                "family": "fixed", "checkpoint_dir": "new/dir",
+                "output": "new.json", "resume": true, "workers": 4,
+            }),
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resume_validation_skip_h2h_allowed_only_when_ignored() {
+        let manifest = json!({
+            "dataset": {"checksum": "a"},
+            "config": {"family": "fixed", "skip_h2h": false},
+        });
+        let strict_config = json!({"family": "fixed", "skip_h2h": true});
+        assert!(validate_resume_manifest(&manifest, Some("a"), &strict_config, false).is_err());
+        validate_resume_manifest(&manifest, Some("a"), &strict_config, true).unwrap();
+    }
+
+    #[test]
+    fn head_to_head_aggregates_group_unordered_pairs_first_seen_order() {
+        let dir = scratch_dir("h2h-pairs");
+        let root = dir.join("checkpoint");
+        let dataset_payload = json!({
+            "checksum": "c", "generator": "g/v1", "seed": 1, "schema_version": 1,
+            "positions": [{"phase": "opening"}],
+        });
+        write_manifest(
+            &root,
+            &build_manifest(&json!({}), &dataset_payload, "running", 0, 0),
+        )
+        .unwrap();
+        // beam-vs-mcts first, then minimax-vs-random; a later beam/mcts
+        // record must still land in the FIRST group (name order from its
+        // first record), not create a duplicate.
+        append_jsonl(
+            &root.join(H2H_RECORDS),
+            &json!({"position_id": "p0", "phase": "opening", "mover": "beam",
+                     "responder": "mcts", "winner": "beam", "plies": 3, "seed": 0}),
+        )
+        .unwrap();
+        append_jsonl(
+            &root.join(H2H_RECORDS),
+            &json!({"position_id": "p0", "phase": "opening", "mover": "minimax",
+                     "responder": "random", "winner": "minimax", "plies": 1, "seed": 0}),
+        )
+        .unwrap();
+        append_jsonl(
+            &root.join(H2H_RECORDS),
+            &json!({"position_id": "p0", "phase": "opening", "mover": "mcts",
+                     "responder": "beam", "winner": "mcts", "plies": 2, "seed": 1}),
+        )
+        .unwrap();
+
+        let bundle_dict = bundle_from_checkpoint(&root).unwrap();
+        let aggregates = bundle_dict["head_to_head"]["aggregates"]
+            .as_array()
+            .unwrap();
+        assert_eq!(aggregates.len(), 2, "two distinct unordered pairs");
+        assert_eq!(aggregates[0]["engine_a"], json!("beam"));
+        assert_eq!(aggregates[0]["engine_b"], json!("mcts"));
+        assert_eq!(
+            aggregates[0]["games"],
+            json!(2),
+            "beam/mcts pair merges both orientations"
+        );
+        assert_eq!(aggregates[1]["engine_a"], json!("minimax"));
+        assert_eq!(aggregates[1]["engine_b"], json!("random"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn cheap_adapters() -> Vec<Box<dyn EngineAdapter>> {
@@ -300,248 +756,78 @@ mod tests {
         ]
     }
 
-    /// Row identity (RunKey) + selected move, used to compare row
-    /// *multisets* (spec: final ordering need not match, content must).
-    fn row_fingerprints(rows: &[Value]) -> BTreeSet<(RunKey, String)> {
-        rows.iter()
-            .map(|row| {
-                (
-                    agreement::row_key(row),
-                    row["move"].as_str().unwrap_or_default().to_string(),
-                )
-            })
-            .collect()
+    fn two_position_payload() -> (Value, Value) {
+        use crate::bitboard::Bitboard;
+        use crate::state::State;
+        let p0 = State::new(Bitboard::EMPTY).to_qfen();
+        let p1 = State::new(Bitboard::EMPTY.with_move(0, 0, 0)).to_qfen();
+        let full = json!({
+            "positions": [
+                {"id": "p0", "qfen": p0, "phase": "opening", "reference": Value::Null},
+                {"id": "p1", "qfen": p1, "phase": "opening", "reference": Value::Null},
+            ]
+        });
+        let truncated = json!({"positions": [full["positions"][0].clone()]});
+        (full, truncated)
     }
 
+    /// Adapted from the PR #10 resume test: interrupting a run after only
+    /// the first position, then resuming over the full position list, must
+    /// reproduce the same row multiset as an uninterrupted run (order need
+    /// not match across the interrupted/resumed split, since resumed rows
+    /// are the concatenation of loaded + freshly streamed).
     #[test]
-    fn interrupted_then_resumed_run_matches_uninterrupted_run() {
+    fn resume_after_interrupt_matches_uninterrupted_run() {
         let (full, truncated) = two_position_payload();
         let adapters = cheap_adapters();
         let seeds = [10u64, 11u64];
+        let dir = scratch_dir("resume-interrupt");
+        let root = dir.join("checkpoint");
+        let obs_path = root.join(OBSERVATIONS);
 
-        let dir = scratch_dir("resume-match");
-        let ckpt_path = dir.join("run.ckpt");
-        let dataset_checksum = "dataset-checksum-abc";
-        let config_fp = "config-fingerprint-xyz";
-
-        // "Interrupted" run: only the first position is processed, streamed
-        // to the checkpoint as it completes.
-        {
-            let mut writer =
-                CheckpointWriter::create(&ckpt_path, dataset_checksum, config_fp).unwrap();
-            run_agreement(&adapters, &truncated, &seeds, &HashSet::new(), |row| {
-                writer.write_row(row)
+        // "Interrupted" run: only the first position is processed.
+        let interrupted_rows =
+            run_agreement(&adapters, &truncated, &seeds, &HashSet::new(), 1, |row| {
+                append_jsonl(&obs_path, row)
             })
             .unwrap();
-        }
-
-        // Resume: load what's there, seed the skip set, run the full
-        // position list, and append newly completed rows.
-        let state = load_checkpoint(&ckpt_path, dataset_checksum, config_fp).unwrap();
         assert_eq!(
-            state.rows.len(),
+            interrupted_rows.len(),
             3,
-            "1 position: random x2 seeds + minimax x1 seed"
+            "1 position: random x2 + minimax x1"
         );
-        let mut writer = CheckpointWriter::resume(&ckpt_path).unwrap();
-        let fresh_rows = run_agreement(&adapters, &full, &seeds, &state.row_skip, |row| {
-            writer.write_row(row)
+
+        // Resume: reload, seed the skip set, run over the full list.
+        let loaded_rows = load_jsonl(&obs_path).unwrap();
+        let skip: HashSet<ObservationKey> = key_set(&loaded_rows, observation_key);
+        let fresh_rows = run_agreement(&adapters, &full, &seeds, &skip, 1, |row| {
+            append_jsonl(&obs_path, row)
         })
         .unwrap();
-        let mut resumed_rows = state.rows;
+        let mut resumed_rows = loaded_rows;
         resumed_rows.extend(fresh_rows);
 
         // From-scratch, uninterrupted run over the same full payload/seeds.
         let scratch_rows =
-            run_agreement(&adapters, &full, &seeds, &HashSet::new(), |_| Ok(())).unwrap();
+            run_agreement(&adapters, &full, &seeds, &HashSet::new(), 1, |_| Ok(())).unwrap();
 
+        let fingerprint = |rows: &[Value]| -> BTreeSet<(ObservationKey, String)> {
+            rows.iter()
+                .map(|row| {
+                    (
+                        observation_key(row),
+                        row["move"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect()
+        };
         assert_eq!(resumed_rows.len(), scratch_rows.len());
-        assert_eq!(
-            row_fingerprints(&resumed_rows),
-            row_fingerprints(&scratch_rows)
-        );
+        assert_eq!(fingerprint(&resumed_rows), fingerprint(&scratch_rows));
 
-        // The checkpoint file itself, reloaded fresh, must also match.
-        let reloaded = load_checkpoint(&ckpt_path, dataset_checksum, config_fp).unwrap();
-        assert_eq!(reloaded.rows.len(), scratch_rows.len());
-        assert_eq!(
-            row_fingerprints(&reloaded.rows),
-            row_fingerprints(&scratch_rows)
-        );
+        // Reloaded from disk, it must still match.
+        let reloaded = load_jsonl(&obs_path).unwrap();
+        assert_eq!(fingerprint(&reloaded), fingerprint(&scratch_rows));
 
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn create_refuses_when_file_already_exists() {
-        let dir = scratch_dir("exists");
-        let path = dir.join("run.ckpt");
-        CheckpointWriter::create(&path, "c", "f").unwrap();
-        let err = CheckpointWriter::create(&path, "c", "f").unwrap_err();
-        assert!(err.contains("--resume"), "{err}");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn mismatched_dataset_checksum_refuses_resume() {
-        let dir = scratch_dir("bad-checksum");
-        let path = dir.join("run.ckpt");
-        CheckpointWriter::create(&path, "checksum-a", "fingerprint-a").unwrap();
-        let err = load_checkpoint(&path, "checksum-b", "fingerprint-a").unwrap_err();
-        assert!(err.contains("checksum"), "{err}");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn mismatched_config_fingerprint_refuses_resume() {
-        let dir = scratch_dir("bad-fingerprint");
-        let path = dir.join("run.ckpt");
-        CheckpointWriter::create(&path, "checksum-a", "fingerprint-a").unwrap();
-        let err = load_checkpoint(&path, "checksum-a", "fingerprint-b").unwrap_err();
-        assert!(err.contains("fingerprint"), "{err}");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn truncated_trailing_line_is_tolerated() {
-        let dir = scratch_dir("truncated");
-        let path = dir.join("run.ckpt");
-        {
-            let mut writer = CheckpointWriter::create(&path, "c", "f").unwrap();
-            writer
-                .write_row(&json!({
-                    "engine": "random", "config_label": "random",
-                    "position_id": "p0", "seed": 0, "move": "0:0:0",
-                }))
-                .unwrap();
-            writer
-                .write_row(&json!({
-                    "engine": "random", "config_label": "random",
-                    "position_id": "p0", "seed": 1, "move": "0:0:1",
-                }))
-                .unwrap();
-        }
-        // Simulate a crash mid-write of the third line: partial JSON, no
-        // trailing newline.
-        {
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap();
-            write!(
-                file,
-                "{{\"kind\":\"observation\",\"row\":{{\"engine\":\"rand"
-            )
-            .unwrap();
-        }
-
-        let state = load_checkpoint(&path, "c", "f").unwrap();
-        assert_eq!(
-            state.rows.len(),
-            2,
-            "the truncated third line must be dropped"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn resume_truncates_dangling_partial_line_before_appending() {
-        let dir = scratch_dir("resume-truncate");
-        let path = dir.join("run.ckpt");
-        {
-            let mut writer = CheckpointWriter::create(&path, "c", "f").unwrap();
-            writer
-                .write_row(&json!({
-                    "engine": "random", "config_label": "random",
-                    "position_id": "p0", "seed": 0, "move": "0:0:0",
-                }))
-                .unwrap();
-        }
-        {
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap();
-            write!(file, "{{\"kind\":\"observation\",\"row\":{{\"garbage").unwrap();
-        }
-
-        // Resuming must drop the dangling partial line, then append a
-        // fresh, well-formed one after it — leaving the file entirely
-        // parseable (no leftover garbage line in the middle).
-        {
-            let mut writer = CheckpointWriter::resume(&path).unwrap();
-            writer
-                .write_row(&json!({
-                    "engine": "random", "config_label": "random",
-                    "position_id": "p1", "seed": 0, "move": "0:0:1",
-                }))
-                .unwrap();
-        }
-
-        let state = load_checkpoint(&path, "c", "f").unwrap();
-        assert_eq!(state.rows.len(), 2);
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn resume_repairs_valid_final_line_missing_only_its_newline() {
-        let dir = scratch_dir("newline-lost");
-        let path = dir.join("run.ckpt");
-        {
-            let mut writer = CheckpointWriter::create(&path, "c", "f").unwrap();
-            writer
-                .write_row(&json!({
-                    "engine": "random", "config_label": "random",
-                    "position_id": "p0", "seed": 0, "move": "0:0:0",
-                }))
-                .unwrap();
-        }
-        // Simulate a crash that persisted the full final line but dropped
-        // only its trailing newline: chop exactly one byte off the file.
-        {
-            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-            let len = file.metadata().unwrap().len();
-            assert_eq!(
-                std::fs::read(&path).unwrap().last(),
-                Some(&b'\n'),
-                "precondition: file ends with a newline"
-            );
-            file.set_len(len - 1).unwrap();
-        }
-
-        // The newline-less final line is still valid JSON and must be kept.
-        let state = load_checkpoint(&path, "c", "f").unwrap();
-        assert_eq!(state.rows.len(), 1);
-
-        // Resume must restore the newline before appending, or the next
-        // record would merge into the previous line and corrupt the file.
-        {
-            let mut writer = CheckpointWriter::resume(&path).unwrap();
-            writer
-                .write_row(&json!({
-                    "engine": "random", "config_label": "random",
-                    "position_id": "p1", "seed": 0, "move": "0:0:1",
-                }))
-                .unwrap();
-        }
-
-        let state = load_checkpoint(&path, "c", "f").unwrap();
-        assert_eq!(state.rows.len(), 2, "both records survive the repair");
-        assert_eq!(state.rows[0]["position_id"], json!("p0"));
-        assert_eq!(state.rows[1]["position_id"], json!("p1"));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn config_fingerprint_ignores_output_and_checkpoint_paths() {
-        let a = json!({"family": "fixed", "seeds": 10, "output": "a.json", "checkpoint": "a.ckpt"});
-        let b = json!({"family": "fixed", "seeds": 10, "output": "b.json", "checkpoint": "b.ckpt"});
-        assert_eq!(config_fingerprint(&a), config_fingerprint(&b));
-
-        let c = json!({"family": "fixed", "seeds": 30, "output": "a.json", "checkpoint": "a.ckpt"});
-        assert_ne!(config_fingerprint(&a), config_fingerprint(&c));
     }
 }

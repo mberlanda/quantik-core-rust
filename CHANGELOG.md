@@ -39,6 +39,11 @@ All notable changes to `quantik-core` are documented here.
   a JSON Lines file as it happens, and `--resume` continues an interrupted
   run from that file instead of restarting it, guarded by a dataset checksum
   and config fingerprint so runs are never silently mixed.
+- Added parallel `--workers N` for benchmark `run`: agreement observations
+  and head-to-head games run on an N-thread rayon pool, with results
+  streamed to the checkpoint/bundle in the same task order as `--workers 1`
+  (byte-identical content too, for adapters whose behavior doesn't depend
+  on real wall-clock CPU time).
 - Added opening-book persistence of exactly-solved benchmark references:
   solved positions are upserted into the existing SQLite opening book keyed
   by the 18-byte canonical key, with reads and writes both restricted to
@@ -48,6 +53,28 @@ All notable changes to `quantik-core` are documented here.
   idempotent `ALTER TABLE`. The schema stays byte- and family-compatible
   with the Python `opening_book.py`, so a book file is readable from either
   language.
+
+### Changed
+
+- **Breaking:** replaced the single-file `.ckpt` benchmark checkpoint format
+  (`run --checkpoint <path>`) with a Python-compatible checkpoint
+  *directory* (`run --checkpoint-dir <dir>`: `manifest.json` written
+  atomically + `observations.jsonl` + `h2h.jsonl`, both compact sorted-key
+  JSON Lines). A checkpoint directory written by this crate now
+  loads/reports correctly in Python's `benchmarks.checkpoint` module and
+  vice versa; resume *validation* stays intra-language, since the two
+  CLIs' config dictionaries differ in shape (documented in
+  `docs/BENCHMARKS.md`). There is no migration path from the old
+  single-file format — a `.ckpt` file cannot be resumed under the new
+  layout. `report --input <dir>` now accepts a checkpoint directory
+  directly and renders a partial-state report (a `"checkpoint": {status,
+  counts}` bundle block, surfaced as two extra Markdown lines) from
+  whatever rows/games have completed so far, without waiting for the run
+  to finish. New `run` flags: `--checkpoint-dir`, `--checkpoint-every`
+  (manifest/progress update cadence), `--workers`; removed: `--checkpoint`.
+  The Rust-only `bundle["resumed"]` boolean from the old format is gone —
+  the `"checkpoint"` block's `status`/`counts` supersede it, matching the
+  Python bundle shape.
 
 ### Fixed
 

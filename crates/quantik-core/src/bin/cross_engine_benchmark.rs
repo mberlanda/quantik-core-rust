@@ -8,18 +8,26 @@ use clap::{Parser, Subcommand};
 use quantik_core::bench::adapters::{
     fixed_time_adapters, BeamAdapter, EngineAdapter, MCTSAdapter, MinimaxAdapter, RandomAdapter,
 };
-use quantik_core::bench::agreement::{aggregate_agreement, aggregate_cost, run_agreement, RunKey};
+use quantik_core::bench::agreement::{
+    aggregate_agreement, aggregate_cost, observation_key, run_agreement, ObservationKey,
+};
 use quantik_core::bench::book_export;
 use quantik_core::bench::bundle::{make_bundle, save_bundle};
-use quantik_core::bench::checkpoint::{self, CheckpointWriter};
+use quantik_core::bench::checkpoint::{
+    append_jsonl, build_manifest, bundle_from_checkpoint, checkpoint_paths, key_set, load_jsonl,
+    load_manifest, update_manifest_counts, validate_resume_manifest, write_manifest,
+};
 use quantik_core::bench::correctness::run_preflight;
-use quantik_core::bench::head_to_head::{aggregate_head_to_head, run_head_to_head, GameKey};
+use quantik_core::bench::head_to_head::{
+    aggregate_head_to_head, h2h_key, run_head_to_head, H2hKey,
+};
 use quantik_core::bench::report::render_markdown;
 use quantik_core::bench::stability::aggregate_stability;
 use quantik_core::bench::{dataset, reference};
 use quantik_core::opening_book::{OpeningBookConfig, OpeningBookDatabase};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
@@ -91,19 +99,39 @@ enum Commands {
         skip_h2h: bool,
         #[arg(long)]
         output: PathBuf,
-        /// Crash-safe JSON Lines checkpoint: streams each completed
-        /// observation/game as it finishes so an interrupted run can be
-        /// resumed instead of restarted from scratch.
-        #[arg(long)]
-        checkpoint: Option<PathBuf>,
-        /// Resume from an existing --checkpoint file (its header must match
-        /// this run's dataset and engine settings). Without this flag, an
-        /// existing checkpoint file is refused rather than silently reused
-        /// or overwritten.
+        /// Crash-safe directory checkpoint (Python-compatible layout:
+        /// `manifest.json` + `observations.jsonl` + `h2h.jsonl`): streams
+        /// each completed observation/game as it finishes so an
+        /// interrupted run can be resumed instead of restarted from
+        /// scratch, and a `report --input <dir>` can render a partial
+        /// state at any time.
+        #[arg(long = "checkpoint-dir")]
+        checkpoint_dir: Option<PathBuf>,
+        /// Resume from an existing --checkpoint-dir (its manifest must
+        /// match this run's dataset checksum and normalized config).
+        /// Without this flag, --checkpoint-dir always starts fresh: the
+        /// directory is created (or its observations.jsonl/h2h.jsonl
+        /// truncated and manifest overwritten) unconditionally — matching
+        /// the Python harness, there is no "refuse to clobber" guard here,
+        /// so pass --resume whenever you mean to continue prior work.
         #[arg(long, default_value_t = false)]
         resume: bool,
+        /// Update the checkpoint manifest, and print a progress line,
+        /// every N completed observation rows / h2h games. 0 disables the
+        /// periodic update (the manifest still updates once per phase).
+        #[arg(long = "checkpoint-every", default_value_t = 1)]
+        checkpoint_every: u64,
+        /// Parallel worker threads for agreement observations and h2h
+        /// games. Must be at least 1. Regardless of worker count, results
+        /// are produced in the same task order and are byte-identical to
+        /// `--workers 1`.
+        #[arg(long, default_value_t = 1)]
+        workers: usize,
     },
-    /// Render a bundle to Markdown.
+    /// Render a bundle to Markdown. `--input` may be a bundle JSON file or
+    /// a `--checkpoint-dir` directory (rehydrated via
+    /// `bundle_from_checkpoint`, so a partial/in-progress checkpoint
+    /// reports fine).
     Report {
         #[arg(long)]
         input: PathBuf,
@@ -180,6 +208,40 @@ fn h2h_positions(payload: &Value, count: usize) -> Vec<Value> {
     picked
 }
 
+/// Total observation rows a full (non-resumed) run would produce:
+/// stochastic adapters run once per seed, deterministic ones once.
+fn expected_observations(
+    adapters: &[Box<dyn EngineAdapter>],
+    positions: usize,
+    seeds: usize,
+) -> usize {
+    let per_position: usize = adapters
+        .iter()
+        .map(|a| if a.stochastic() { seeds } else { 1 })
+        .sum();
+    per_position * positions
+}
+
+/// Total head-to-head records a full (non-resumed) run would produce:
+/// every unordered adapter pair, both orientations, per position and seed.
+fn expected_h2h_records(
+    adapters: &[Box<dyn EngineAdapter>],
+    positions: usize,
+    seeds: usize,
+) -> usize {
+    let n = adapters.len();
+    let pair_count = n.saturating_sub(1) * n / 2;
+    pair_count * positions * seeds * 2
+}
+
+/// Print a progress line to stdout, flushed immediately (mirrors Python's
+/// `print(..., flush=True)` — needed because stdout is fully buffered,
+/// not line-buffered, when not attached to a terminal).
+fn print_progress(message: &str) {
+    println!("{message}");
+    let _ = std::io::stdout().flush();
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_run(
     dataset_path: &Path,
@@ -190,17 +252,28 @@ fn cmd_run(
     h2h_seed_count: u64,
     skip_h2h: bool,
     output: &Path,
-    checkpoint_path: Option<&Path>,
+    checkpoint_dir: Option<&Path>,
     resume: bool,
+    checkpoint_every: u64,
+    workers: usize,
 ) -> Result<(), String> {
+    if workers < 1 {
+        return Err("workers must be at least 1".into());
+    }
+
     let payload = dataset::load(dataset_path)?;
-
     let seeds: Vec<u64> = (0..seeds_count).map(|i| seed_base + i).collect();
+    let adapters = build_adapters(&args);
+    let positions = payload["positions"].as_array().cloned().unwrap_or_default();
+    let sampled_h2h_positions = h2h_positions(&payload, h2h_position_count);
+    let h2h_seeds: Vec<u64> = (0..h2h_seed_count).map(|i| seed_base + i).collect();
 
-    // Config is fixed by the CLI args alone (no run results feed back into
-    // it), so it can be assembled up front and fingerprinted for the
-    // checkpoint header before any engine work starts.
-    let config = json!({
+    // Config is fixed by the CLI args alone, so it can be assembled up
+    // front and used both for the checkpoint manifest and the final
+    // bundle. `checkpoint_dir`/`output`/`resume`/`workers` (and, were it
+    // implemented, `skip_agreement`) are excluded from resume validation
+    // by `checkpoint::normalize_run_config` — see docs/BENCHMARKS.md.
+    let run_config = json!({
         "dataset": dataset_path.to_string_lossy(),
         "family": args.family,
         "time_limit": args.time_limit,
@@ -216,150 +289,256 @@ fn cmd_run(
         "h2h_positions": h2h_position_count,
         "h2h_seeds": h2h_seed_count,
         "skip_h2h": skip_h2h,
+        "checkpoint_dir": checkpoint_dir.map(|p| p.to_string_lossy().to_string()),
+        "resume": resume,
+        "checkpoint_every": checkpoint_every,
+        "workers": workers,
         "output": output.to_string_lossy(),
-        "checkpoint": checkpoint_path.map(|p| p.to_string_lossy().to_string()),
         "engine_seeds": seeds,
     });
-    let dataset_checksum = payload["checksum"].as_str().unwrap_or_default().to_string();
-    let config_fingerprint = checkpoint::config_fingerprint(&config);
+    let dataset_checksum = payload["checksum"].as_str().map(str::to_string);
 
-    // Checkpoint validation runs BEFORE preflight so user errors (an
-    // existing checkpoint without --resume, a header mismatch, a missing
-    // file with --resume) are refused immediately, not after expensive
-    // engine work. The writer itself is only opened after preflight passes,
-    // so an aborted preflight never leaves a header-only checkpoint behind.
-    let mut loaded_rows: Vec<Value> = Vec::new();
-    let mut loaded_records: Vec<Value> = Vec::new();
-    let mut row_skip: HashSet<RunKey> = HashSet::new();
-    let mut record_skip: HashSet<GameKey> = HashSet::new();
-    let mut resumed = false;
+    let paths = checkpoint_dir.map(checkpoint_paths);
 
-    if resume && checkpoint_path.is_none() {
-        eprintln!("warning: --resume has no effect without --checkpoint <path>; running fresh");
-    }
-    if let Some(path) = checkpoint_path {
+    // Checkpoint setup/validation runs BEFORE preflight so user errors (an
+    // existing checkpoint without --resume, a missing/mismatched manifest)
+    // are refused immediately, not after expensive engine work.
+    if let Some(paths) = &paths {
         if resume {
-            if !path.exists() {
+            if !paths.manifest.exists() {
                 return Err(format!(
-                    "--resume requires an existing checkpoint at {}; omit --resume to start a \
-                     fresh run",
-                    path.display()
+                    "RESUME FAILED - checkpoint manifest not found: {}",
+                    paths.manifest.display()
                 ));
             }
-            let state = checkpoint::load_checkpoint(path, &dataset_checksum, &config_fingerprint)?;
-            loaded_rows = state.rows;
-            loaded_records = state.records;
-            row_skip = state.row_skip;
-            record_skip = state.record_skip;
-            resumed = true;
-        } else if path.exists() {
-            return Err(format!(
-                "checkpoint file already exists at {}; pass --resume to continue it, or delete \
-                 it to start a fresh run",
-                path.display()
-            ));
+            let manifest = load_manifest(&paths.manifest)?;
+            let allow_skip_h2h_mismatch = if skip_h2h {
+                let existing_records = load_jsonl(&paths.h2h)?;
+                let expected_h2h =
+                    expected_h2h_records(&adapters, sampled_h2h_positions.len(), h2h_seeds.len());
+                if existing_records.len() != expected_h2h {
+                    return Err(format!(
+                        "RESUME FAILED - checkpoint h2h records incomplete: expected {expected_h2h}, found {}",
+                        existing_records.len()
+                    ));
+                }
+                true
+            } else {
+                false
+            };
+            validate_resume_manifest(
+                &manifest,
+                dataset_checksum.as_deref(),
+                &run_config,
+                allow_skip_h2h_mismatch,
+            )
+            .map_err(|e| format!("RESUME FAILED - {e}"))?;
+        } else {
+            std::fs::create_dir_all(&paths.root)
+                .map_err(|e| format!("mkdir {:?}: {e}", paths.root))?;
+            std::fs::write(&paths.observations, "")
+                .map_err(|e| format!("truncate {:?}: {e}", paths.observations))?;
+            std::fs::write(&paths.h2h, "").map_err(|e| format!("truncate {:?}: {e}", paths.h2h))?;
+            let manifest = build_manifest(&run_config, &payload, "preflight", 0, 0);
+            write_manifest(&paths.manifest, &manifest)?;
         }
     }
 
-    let adapters = build_adapters(&args);
-    let positions = payload["positions"].as_array().cloned().unwrap_or_default();
-
+    print_progress(&format!(
+        "preflight: checking {} adapters across {} sample positions",
+        adapters.len(),
+        positions.len().min(3)
+    ));
     let failures = run_preflight(&adapters, &positions);
     if !failures.is_empty() {
+        if let Some(paths) = &paths {
+            if paths.manifest.exists() {
+                let obs_count = load_jsonl(&paths.observations)?.len() as u64;
+                let h2h_count = load_jsonl(&paths.h2h)?.len() as u64;
+                update_manifest_counts(
+                    &paths.manifest,
+                    obs_count,
+                    h2h_count,
+                    Some("preflight_failed"),
+                )?;
+            }
+        }
         eprintln!("PREFLIGHT FAILED - benchmark aborted:");
         for failure in &failures {
             eprintln!("  - {failure}");
         }
         return Err("preflight failed".into());
     }
+    print_progress("preflight: passed");
 
-    let mut checkpoint_writer: Option<CheckpointWriter> = match (checkpoint_path, resume) {
-        (Some(path), true) => Some(CheckpointWriter::resume(path)?),
-        (Some(path), false) => Some(CheckpointWriter::create(
-            path,
-            &dataset_checksum,
-            &config_fingerprint,
-        )?),
-        (None, _) => None,
+    let result: Value = match &paths {
+        None => {
+            print_progress(&format!(
+                "agreement: running {} positions with {} seed(s), workers={workers}",
+                positions.len(),
+                seeds.len()
+            ));
+            let rows = run_agreement(
+                &adapters,
+                &payload,
+                &seeds,
+                &HashSet::new(),
+                workers,
+                |_| Ok(()),
+            )?;
+
+            let mut h2h_records: Vec<Value> = Vec::new();
+            let mut h2h_aggregates: Vec<Value> = Vec::new();
+            if !skip_h2h {
+                print_progress(&format!(
+                    "h2h: running {} positions with {} seed(s), workers={workers}",
+                    sampled_h2h_positions.len(),
+                    h2h_seeds.len()
+                ));
+                for i in 0..adapters.len() {
+                    for j in (i + 1)..adapters.len() {
+                        let name_i = adapters[i].name();
+                        let name_j = adapters[j].name();
+                        let records = run_head_to_head(
+                            adapters[i].as_ref(),
+                            adapters[j].as_ref(),
+                            &sampled_h2h_positions,
+                            &h2h_seeds,
+                            &HashSet::new(),
+                            workers,
+                            |_| Ok(()),
+                        )?;
+                        h2h_aggregates.push(aggregate_head_to_head(&records, name_i, name_j));
+                        h2h_records.extend(records);
+                    }
+                }
+            }
+
+            make_bundle(
+                run_config,
+                &payload,
+                rows.clone(),
+                json!({"records": h2h_records, "aggregates": h2h_aggregates}),
+                json!({
+                    "agreement": aggregate_agreement(&rows),
+                    "cost": aggregate_cost(&rows),
+                    "stability": aggregate_stability(&rows),
+                }),
+            )
+        }
+        Some(paths) => {
+            let existing_rows = load_jsonl(&paths.observations)?;
+            if skip_h2h && !resume {
+                std::fs::write(&paths.h2h, "")
+                    .map_err(|e| format!("truncate {:?}: {e}", paths.h2h))?;
+            }
+            let existing_records = load_jsonl(&paths.h2h)?;
+
+            let observation_skips: HashSet<ObservationKey> =
+                key_set(&existing_rows, observation_key);
+            let h2h_skips: HashSet<H2hKey> = key_set(&existing_records, h2h_key);
+
+            update_manifest_counts(
+                &paths.manifest,
+                existing_rows.len() as u64,
+                existing_records.len() as u64,
+                Some("running"),
+            )?;
+
+            let mut completed_observations = existing_rows.len() as u64;
+            let total_observations = expected_observations(&adapters, positions.len(), seeds.len());
+            print_progress(&format!(
+                "agreement: {completed_observations}/{total_observations} observations complete; \
+                 workers={workers}; checkpoint {}",
+                paths.observations.display()
+            ));
+
+            run_agreement(
+                &adapters,
+                &payload,
+                &seeds,
+                &observation_skips,
+                workers,
+                |row| {
+                    append_jsonl(&paths.observations, row)?;
+                    completed_observations += 1;
+                    if checkpoint_every > 0
+                        && completed_observations.is_multiple_of(checkpoint_every)
+                    {
+                        update_manifest_counts(
+                            &paths.manifest,
+                            completed_observations,
+                            existing_records.len() as u64,
+                            Some("running"),
+                        )?;
+                        print_progress(&format!(
+                            "agreement: {completed_observations}/{total_observations} \
+                             observations checkpointed"
+                        ));
+                    }
+                    Ok(())
+                },
+            )?;
+
+            let mut completed_h2h = existing_records.len() as u64;
+            if !skip_h2h {
+                let total_h2h =
+                    expected_h2h_records(&adapters, sampled_h2h_positions.len(), h2h_seeds.len());
+                print_progress(&format!(
+                    "h2h: {completed_h2h}/{total_h2h} games complete; workers={workers}; \
+                     checkpoint {}",
+                    paths.h2h.display()
+                ));
+                for i in 0..adapters.len() {
+                    for j in (i + 1)..adapters.len() {
+                        run_head_to_head(
+                            adapters[i].as_ref(),
+                            adapters[j].as_ref(),
+                            &sampled_h2h_positions,
+                            &h2h_seeds,
+                            &h2h_skips,
+                            workers,
+                            |record| {
+                                append_jsonl(&paths.h2h, record)?;
+                                completed_h2h += 1;
+                                if checkpoint_every > 0
+                                    && completed_h2h.is_multiple_of(checkpoint_every)
+                                {
+                                    update_manifest_counts(
+                                        &paths.manifest,
+                                        completed_observations,
+                                        completed_h2h,
+                                        Some("running"),
+                                    )?;
+                                    print_progress(&format!(
+                                        "h2h: {completed_h2h}/{total_h2h} games checkpointed"
+                                    ));
+                                }
+                                Ok(())
+                            },
+                        )?;
+                    }
+                }
+            }
+
+            update_manifest_counts(
+                &paths.manifest,
+                completed_observations,
+                completed_h2h,
+                Some("complete"),
+            )?;
+            bundle_from_checkpoint(&paths.root)?
+        }
     };
 
-    let fresh_rows =
-        run_agreement(
-            &adapters,
-            &payload,
-            &seeds,
-            &row_skip,
-            |row| match checkpoint_writer.as_mut() {
-                Some(writer) => writer.write_row(row),
-                None => Ok(()),
-            },
-        )?;
-    let mut rows = loaded_rows;
-    rows.extend(fresh_rows);
-
-    let mut h2h_records: Vec<Value> = Vec::new();
-    let mut h2h_aggregates: Vec<Value> = Vec::new();
-    if !skip_h2h {
-        let sampled = h2h_positions(&payload, h2h_position_count);
-        let h2h_seeds: Vec<u64> = (0..h2h_seed_count).map(|i| seed_base + i).collect();
-        for i in 0..adapters.len() {
-            for j in (i + 1)..adapters.len() {
-                let name_i = adapters[i].name();
-                let name_j = adapters[j].name();
-                let fresh = run_head_to_head(
-                    adapters[i].as_ref(),
-                    adapters[j].as_ref(),
-                    &sampled,
-                    &h2h_seeds,
-                    &record_skip,
-                    |record| match checkpoint_writer.as_mut() {
-                        Some(writer) => writer.write_record(record),
-                        None => Ok(()),
-                    },
-                )?;
-                // A checkpoint's h2h records span every pairing, streamed
-                // in one flat file; attribute the loaded ones back to this
-                // specific unordered pair by filtering on {mover,
-                // responder}, mirroring how the per-pair aggregate is
-                // accumulated below for freshly played games.
-                let pair_records: Vec<Value> = loaded_records
-                    .iter()
-                    .filter(|record| {
-                        let mover = record["mover"].as_str().unwrap_or_default();
-                        let responder = record["responder"].as_str().unwrap_or_default();
-                        (mover == name_i && responder == name_j)
-                            || (mover == name_j && responder == name_i)
-                    })
-                    .cloned()
-                    .chain(fresh.iter().cloned())
-                    .collect();
-                h2h_aggregates.push(aggregate_head_to_head(&pair_records, name_i, name_j));
-                h2h_records.extend(fresh);
-            }
-        }
-        h2h_records.extend(loaded_records);
-    }
-
-    let games = h2h_records.len();
-    let mut bundle = make_bundle(
-        config,
-        &payload,
-        rows.clone(),
-        json!({"records": h2h_records, "aggregates": h2h_aggregates}),
-        json!({
-            "agreement": aggregate_agreement(&rows),
-            "cost": aggregate_cost(&rows),
-            "stability": aggregate_stability(&rows),
-        }),
-    );
-    bundle["resumed"] = json!(resumed);
-    save_bundle(&bundle, output)?;
+    save_bundle(&result, output)?;
     println!(
-        "bundle: {} observations, {} games -> {}{}",
-        rows.len(),
-        games,
-        output.display(),
-        if resumed { " (resumed)" } else { "" }
+        "bundle: {} observations, {} games -> {}",
+        result["observations"].as_array().map_or(0, Vec::len),
+        result["head_to_head"]["records"]
+            .as_array()
+            .map_or(0, Vec::len),
+        output.display()
     );
     Ok(())
 }
@@ -414,8 +593,12 @@ fn cmd_dataset(
 }
 
 fn cmd_report(input: &Path, output: Option<PathBuf>) -> Result<(), String> {
-    let text = std::fs::read_to_string(input).map_err(|e| format!("read {input:?}: {e}"))?;
-    let bundle: Value = serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
+    let bundle: Value = if input.is_dir() {
+        bundle_from_checkpoint(input)?
+    } else {
+        let text = std::fs::read_to_string(input).map_err(|e| format!("read {input:?}: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?
+    };
     let output = output.unwrap_or_else(|| input.with_extension("md"));
     std::fs::write(&output, render_markdown(&bundle))
         .map_err(|e| format!("write {output:?}: {e}"))?;
@@ -472,8 +655,10 @@ fn main() {
             h2h_seeds,
             skip_h2h,
             output,
-            checkpoint,
+            checkpoint_dir,
             resume,
+            checkpoint_every,
+            workers,
         } => cmd_run(
             &dataset,
             RunArgs {
@@ -493,8 +678,10 @@ fn main() {
             h2h_seeds,
             skip_h2h,
             &output,
-            checkpoint.as_deref(),
+            checkpoint_dir.as_deref(),
             resume,
+            checkpoint_every,
+            workers,
         ),
         Commands::Report { input, output } => cmd_report(&input, output),
         Commands::ExportBook { input, db } => cmd_export_book(&input, &db),
