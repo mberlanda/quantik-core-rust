@@ -47,8 +47,8 @@ serde/serde_json) plus `sha2` (checksums) and `chrono` (timestamps).
 | 4 beam search engine | #6 | MERGED |
 | 5 bench foundations (metrics, dataset, canonical JSON) | #7 | MERGED |
 | 6 reference solver + adapters + preflight | #8 | MERGED |
-| 7 aggregation + h2h + bundle + report + CLI | — | IN REVIEW: implemented on branch `feat/bench-cli`, gates green, PR open |
-| 8 checkpoint/resume | — | TODO (hooks already in run_agreement/run_head_to_head signatures: `skip` set + `on_row` callback) |
+| 7 aggregation + h2h + bundle + report + CLI | #9 | MERGED |
+| 8 checkpoint/resume | #10 | IN REVIEW: PR #10 open |
 | 9 opening-book persistence | — | TODO |
 | 10 changelog/docs + full benchmark run | — | TODO |
 
@@ -473,7 +473,21 @@ Design (addresses "no checkpoints, verbose JSON, repeated trees"):
   a clear error (never silently mix runs).
 - Bundle gains `"resumed": bool`. Observations stay schema-identical.
 
-- [ ] Steps: failing tests → implement → pass → commit `feat: add crash-safe checkpoint/resume to benchmark runs`.
+- [x] Steps: failing tests → implement → pass → commit `feat: add crash-safe checkpoint/resume to benchmark runs`.
+  NOTE (2026-07-12): implementation finished — `bench::checkpoint` (JSON
+  Lines writer/loader, sha256 config fingerprint, truncated-tail
+  tolerance), `--checkpoint`/`--resume` wired into the `run` CLI (on_row/
+  on_record callbacks now return `Result` so a write failure aborts the
+  run), `bundle["resumed"]` added, `docs/BENCHMARKS.md` "Checkpoint and
+  resume" section written. fmt/clippy/test/release gates green (109
+  workspace tests, ~2.6s). Smoke-verified manually: checkpoint file grew to
+  277 lines (1 header + 252 observations + 24 h2h) during a
+  `--time-limit 0.05 --seeds 2 --h2h-positions 2 --h2h-seeds 1` run; a
+  `--resume` rerun after deleting only the output JSON reproduced 252
+  observations / 24 games / 6 h2h aggregates with `"resumed": true` and
+  left the checkpoint file unchanged (everything skipped); re-running
+  without `--resume` against the same checkpoint path correctly refused
+  (exit 1) instead of overwriting it.
   Tests: (a) run_agreement with a checkpoint writer, simulate interruption by
   running only 2 of 4 positions (truncate adapter list/position slice), then
   resume: completed tuples skipped, final row multiset equals an uninterrupted

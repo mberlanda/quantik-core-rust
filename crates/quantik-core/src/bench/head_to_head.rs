@@ -64,13 +64,19 @@ pub fn record_key(record: &Value) -> GameKey {
 }
 
 /// Play both engine orientations per position and seed.
+///
+/// `on_record` is invoked after each completed game (checkpoint hook — it
+/// returns `Result` so a checkpoint write failure aborts the run instead of
+/// being silently dropped); `skip` games are not replayed (their records
+/// must already be accounted for by the caller, e.g. loaded from a
+/// checkpoint).
 pub fn run_head_to_head(
     adapter_a: &dyn EngineAdapter,
     adapter_b: &dyn EngineAdapter,
     positions: &[Value],
     seeds: &[u64],
     skip: &HashSet<GameKey>,
-    mut on_record: impl FnMut(&Value),
+    mut on_record: impl FnMut(&Value) -> Result<(), String>,
 ) -> Result<Vec<Value>, String> {
     let mut records = Vec::new();
     for position in positions {
@@ -97,7 +103,7 @@ pub fn run_head_to_head(
                     "plies": plies,
                     "seed": seed,
                 });
-                on_record(&record);
+                on_record(&record)?;
                 records.push(record);
             }
         }
@@ -208,8 +214,10 @@ mod tests {
             max_depth: 1,
             time_limit_s: None,
         };
-        let records =
-            run_head_to_head(&a, &minimax, &positions, &[0, 1], &HashSet::new(), |_| {}).unwrap();
+        let records = run_head_to_head(&a, &minimax, &positions, &[0, 1], &HashSet::new(), |_| {
+            Ok(())
+        })
+        .unwrap();
         // 1 position × 2 seeds × 2 orientations.
         assert_eq!(records.len(), 4);
         for record in &records {
