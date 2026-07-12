@@ -48,7 +48,7 @@ serde/serde_json) plus `sha2` (checksums) and `chrono` (timestamps).
 | 5 bench foundations (metrics, dataset, canonical JSON) | #7 | MERGED |
 | 6 reference solver + adapters + preflight | #8 | MERGED |
 | 7 aggregation + h2h + bundle + report + CLI | #9 | MERGED |
-| 8 checkpoint/resume | — | IN REVIEW: implemented on branch `feat/bench-checkpoints`, gates green, PR open |
+| 8 checkpoint/resume | #10 | IN REVIEW: PR #10 open |
 | 9 opening-book persistence | — | TODO |
 | 10 changelog/docs + full benchmark run | — | TODO |
 
