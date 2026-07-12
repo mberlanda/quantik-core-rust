@@ -48,7 +48,7 @@ serde/serde_json) plus `sha2` (checksums) and `chrono` (timestamps).
 | 5 bench foundations (metrics, dataset, canonical JSON) | #7 | MERGED |
 | 6 reference solver + adapters + preflight | #8 | MERGED |
 | 7 aggregation + h2h + bundle + report + CLI | #9 | MERGED |
-| 8 checkpoint/resume | #10 | IN REVIEW: PR #10 open |
+| 8 checkpoint/resume | #10 | MERGED |
 | 9 opening-book persistence | — | TODO |
 | 10 changelog/docs + full benchmark run | — | TODO |
 
@@ -522,7 +522,14 @@ cross-language"):
   solved references from an artifact into the book. SQLite file remains
   readable by the Python `opening_book.py` (same schema family).
 
-- [ ] Steps: failing tests → implement → pass → commit `feat: persist solved references into the opening book and reuse them across runs`.
+- [x] Steps: failing tests → implement → pass → commit `feat: persist solved references into the opening book and reuse them across runs`.
+  NOTE (2026-07-12): implemented — idempotent ALTER TABLE migration
+  (`solved`/`game_value`), `add_solved_position`, `bench::book_export`
+  (export_references + representative-only lookup_reference),
+  `solve_position_with_book`/`augment_with_references_with_book` (old fns
+  delegate with None), `dataset --book` + `export-book` CLI, BENCHMARKS.md
+  section. Gates green (120 tests, ~2s debug). CLI smoke: golden dataset
+  export inserted 22 references, rerun idempotent (22 rows).
   Tests: (a) solving a position with `--book` writes a row; solving again
   hits the book (assert via nodes==0 marker or a probe counter) and returns
   an identical reference; (b) export-book from the golden dataset inserts

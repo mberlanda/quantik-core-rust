@@ -6,6 +6,7 @@
 
 pub mod adapters;
 pub mod agreement;
+pub mod book_export;
 pub mod bundle;
 pub mod canonical;
 pub mod checkpoint;

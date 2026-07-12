@@ -33,6 +33,12 @@ pub struct OpeningBookEntry {
     pub best_moves: Vec<(i32, i32)>, // (shape, position)
     pub is_terminal: TerminalStatus,
     pub symmetry_count: i32,
+    /// Whether this position carries an exactly-solved game value (see
+    /// [`OpeningBookDatabase::add_solved_position`]). `false`/default for
+    /// rows written before the `solved`/`game_value` columns existed.
+    pub solved: bool,
+    /// Exact game value for the side to move (+1/-1), when `solved`.
+    pub game_value: Option<i32>,
 }
 
 pub struct OpeningBookConfig {
@@ -103,6 +109,21 @@ impl OpeningBookDatabase {
             CREATE INDEX IF NOT EXISTS idx_edges_child ON position_edges(child_key);",
         )?;
 
+        // Idempotent migration for DBs created before the `solved`/
+        // `game_value` columns existed: SQLite has no `ADD COLUMN IF NOT
+        // EXISTS`, so attempt the ALTER and swallow the "duplicate column
+        // name" error it raises when the column is already there.
+        for stmt in [
+            "ALTER TABLE positions ADD COLUMN solved INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE positions ADD COLUMN game_value INTEGER",
+        ] {
+            if let Err(e) = conn.execute_batch(stmt) {
+                if !e.to_string().contains("duplicate column name") {
+                    return Err(e);
+                }
+            }
+        }
+
         Ok(Self {
             conn,
             db_path: config.database_path.clone(),
@@ -160,13 +181,64 @@ impl OpeningBookDatabase {
         Ok(())
     }
 
+    /// Upsert an exactly-solved position: `evaluation` is `game_value` as
+    /// `f64`, `is_terminal` stays `Interior` (the position itself is not
+    /// terminal — its *game value* is exactly known), `depth` is pieces
+    /// placed (derived from `state.bb`), and `best_moves` records every
+    /// optimal move (not just a top-5 slice, unlike [`Self::add_position`])
+    /// as `(shape, position)` pairs in the given order.
+    ///
+    /// Visit/win/draw counters and `symmetry_count` are not meaningful for
+    /// a solved reference and are stored as `0`.
+    pub fn add_solved_position(
+        &self,
+        state: &State,
+        game_value: i32,
+        optimal_moves: &[(i32, i32)],
+    ) -> SqlResult<()> {
+        let canonical_key = state.canonical_key().to_vec();
+        let qfen = state.to_qfen();
+        let depth = (state.bb.player_piece_count(0) + state.bb.player_piece_count(1)) as i32;
+        let evaluation = game_value as f64;
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO positions
+             (canonical_key, qfen, depth, evaluation, visit_count,
+              win_count_p0, win_count_p1, draw_count, is_terminal, symmetry_count,
+              solved, game_value)
+             VALUES (?1, ?2, ?3, ?4, 0, 0, 0, 0, ?5, 0, 1, ?6)",
+            params![
+                canonical_key,
+                qfen,
+                depth,
+                evaluation,
+                TerminalStatus::Interior as i32,
+                game_value,
+            ],
+        )?;
+
+        self.conn.execute(
+            "DELETE FROM best_moves WHERE canonical_key = ?1",
+            params![canonical_key],
+        )?;
+
+        for (rank, &(shape, position)) in optimal_moves.iter().enumerate() {
+            self.conn.execute(
+                "INSERT INTO best_moves (canonical_key, move_rank, shape, position)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![canonical_key, (rank + 1) as i32, shape, position],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn get_position(&self, state: &State) -> SqlResult<Option<OpeningBookEntry>> {
         let canonical_key = state.canonical_key().to_vec();
 
         let mut stmt = self.conn.prepare(
             "SELECT qfen, depth, evaluation, visit_count,
                     win_count_p0, win_count_p1, draw_count,
-                    is_terminal, symmetry_count
+                    is_terminal, symmetry_count, solved, game_value
              FROM positions WHERE canonical_key = ?1",
         )?;
 
@@ -183,6 +255,8 @@ impl OpeningBookDatabase {
                 best_moves: Vec::new(), // filled below
                 is_terminal: TerminalStatus::from_i32(row.get(7)?),
                 symmetry_count: row.get(8)?,
+                solved: row.get::<_, i64>(9)? != 0,
+                game_value: row.get(10)?,
             })
         });
 
@@ -207,7 +281,7 @@ impl OpeningBookDatabase {
         let mut stmt = self.conn.prepare(
             "SELECT canonical_key, qfen, depth, evaluation, visit_count,
                     win_count_p0, win_count_p1, draw_count,
-                    is_terminal, symmetry_count
+                    is_terminal, symmetry_count, solved, game_value
              FROM positions WHERE depth = ?1
              ORDER BY visit_count DESC LIMIT ?2",
         )?;
@@ -226,6 +300,8 @@ impl OpeningBookDatabase {
                     best_moves: Vec::new(),
                     is_terminal: TerminalStatus::from_i32(row.get(8)?),
                     symmetry_count: row.get(9)?,
+                    solved: row.get::<_, i64>(10)? != 0,
+                    game_value: row.get(11)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -417,6 +493,98 @@ mod tests {
 
         let entries = db.query_by_depth(1, 10).unwrap();
         assert!(entries.is_empty());
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn add_solved_position_roundtrips() {
+        let path = temp_db_path();
+        let config = OpeningBookConfig {
+            database_path: path.clone(),
+            ..Default::default()
+        };
+        let db = OpeningBookDatabase::open(&config).unwrap();
+
+        let state = State::empty();
+        db.add_solved_position(&state, 1, &[(0, 0), (1, 5)])
+            .unwrap();
+
+        let entry = db.get_position(&state).unwrap().unwrap();
+        assert!(entry.solved);
+        assert_eq!(entry.game_value, Some(1));
+        assert_eq!(entry.evaluation, 1.0);
+        assert_eq!(entry.is_terminal, TerminalStatus::Interior);
+        assert_eq!(entry.depth, 0);
+        assert_eq!(entry.best_moves, vec![(0, 0), (1, 5)]);
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// Opening a pre-existing DB created with the OLD schema (no
+    /// `solved`/`game_value` columns) must upgrade it in place: `open()`
+    /// succeeds and `get_position` returns the migrated defaults
+    /// (`solved: false`, `game_value: None`) for rows written before the
+    /// migration existed.
+    #[test]
+    fn migration_upgrades_pre_existing_db() {
+        let path = temp_db_path();
+
+        // Build the OLD schema by hand (mirrors the CREATE TABLE that
+        // predates the solved/game_value columns) and insert a row via raw
+        // SQL, bypassing OpeningBookDatabase entirely.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE positions (
+                    canonical_key BLOB PRIMARY KEY,
+                    qfen TEXT NOT NULL,
+                    depth INTEGER NOT NULL,
+                    evaluation REAL NOT NULL,
+                    visit_count INTEGER NOT NULL,
+                    win_count_p0 INTEGER NOT NULL,
+                    win_count_p1 INTEGER NOT NULL,
+                    draw_count INTEGER NOT NULL,
+                    is_terminal INTEGER NOT NULL DEFAULT 0,
+                    symmetry_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE best_moves (
+                    canonical_key BLOB NOT NULL,
+                    move_rank INTEGER NOT NULL,
+                    shape INTEGER NOT NULL,
+                    position INTEGER NOT NULL,
+                    PRIMARY KEY (canonical_key, move_rank)
+                );",
+            )
+            .unwrap();
+
+            let state = State::empty();
+            let canonical_key = state.canonical_key().to_vec();
+            conn.execute(
+                "INSERT INTO positions
+                 (canonical_key, qfen, depth, evaluation, visit_count,
+                  win_count_p0, win_count_p1, draw_count, is_terminal, symmetry_count)
+                 VALUES (?1, ?2, 0, 0.5, 7, 3, 2, 1, 0, 1)",
+                params![canonical_key, state.to_qfen()],
+            )
+            .unwrap();
+        }
+
+        // Opening via OpeningBookDatabase must succeed (idempotent ALTER
+        // TABLE) and see the pre-existing row with migrated defaults.
+        let config = OpeningBookConfig {
+            database_path: path.clone(),
+            ..Default::default()
+        };
+        let db = OpeningBookDatabase::open(&config).unwrap();
+        let entry = db.get_position(&State::empty()).unwrap().unwrap();
+        assert!(!entry.solved);
+        assert_eq!(entry.game_value, None);
+        assert_eq!(entry.visit_count, 7);
+
+        // Re-opening again (columns already present) must also succeed.
+        OpeningBookDatabase::open(&config).unwrap();
 
         fs::remove_file(&path).ok();
     }

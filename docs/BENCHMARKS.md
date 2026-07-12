@@ -146,6 +146,58 @@ at all. On a successful resumed run, the result bundle's top-level
 checkpoint's rows/games and any newly completed ones — order is not
 preserved, but no row is duplicated or lost.
 
+## Opening Book Persistence
+
+Exactly-solved references can be persisted into the existing SQLite
+opening book and reused across runs, so repeated dataset builds stop
+recomputing identical solve trees. This is a Rust-only addition — the
+Python harness recomputes every reference from scratch.
+
+**What is stored:** one row per solved position in the book's `positions`
+table, keyed by the 18-byte canonical key (`State::canonical_key()`),
+with `solved = 1`, `game_value` = the exact game value for the side to
+move (+1/-1, stored as-is), `evaluation` = the game value as a float,
+`depth` = pieces placed, and the complete optimal move set as
+`(shape, position)` pairs in the `best_moves` table — recorded in the
+canonical orientation. Pre-existing book databases are upgraded in place:
+opening one adds the `solved`/`game_value` columns idempotently, and old
+rows read back as `solved = false`.
+
+**Representative-only lookup caveat:** the stored optimal moves are in
+the orientation of the position that was solved, but the row is keyed by
+the canonical key, which is shared by up to eight symmetric orientations.
+The book does not (yet) record which symmetry transform maps the stored
+orientation to an arbitrary query, so a lookup only returns a hit when
+the queried board **is its own canonical representative** — otherwise the
+solver falls through to a fresh minimax solve (and writes the result
+back). Move translation across orientations is a documented follow-up;
+until then, book hits accelerate the canonical-representative subset of
+queries and never risk serving moves that are illegal in the queried
+orientation.
+
+**Cross-language portability:** the canonical key is byte-identical to
+the Python implementation's (`VERSION=1`, `FLAG_CANON=2`, little-endian
+`<BB8H>`), and the schema is the same family as `opening_book.py`'s, so
+the SQLite file itself is portable — a book populated by
+`quantik-core-rust` is readable from Python and vice versa.
+
+Two CLI entry points:
+
+```bash
+# Read-through/write-back during dataset generation: solved positions
+# short-circuit repeated solves; fresh solves are persisted.
+cargo run --release --bin cross_engine_benchmark -- dataset \
+  --seed 20260711 --solve-budget 30.0 \
+  --book benchmarks/results/book.db \
+  --output benchmarks/positions-v1.json
+
+# Bulk-export all solved references from an existing (checksum-verified)
+# dataset artifact into a book. Idempotent: reruns upsert the same rows.
+cargo run --release --bin cross_engine_benchmark -- export-book \
+  --input benchmarks/positions-v1.json \
+  --db benchmarks/results/book.db
+```
+
 ## Reproducing A Run
 
 Generate or update the committed dataset artifact:
