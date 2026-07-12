@@ -24,14 +24,16 @@ pub fn row_key(row: &Value) -> RunKey {
 
 /// Return one move-observation row per adapter, position, and seed run.
 ///
-/// `on_row` is invoked after each completed row (checkpoint hook);
-/// `skip` rows are not re-run (their rows must already be in `rows`).
+/// `on_row` is invoked after each completed row (checkpoint hook — it
+/// returns `Result` so a checkpoint write failure aborts the run instead of
+/// being silently dropped); `skip` rows are not re-run (their rows must
+/// already be accounted for by the caller, e.g. loaded from a checkpoint).
 pub fn run_agreement(
     adapters: &[Box<dyn EngineAdapter>],
     payload: &Value,
     seeds: &[u64],
     skip: &HashSet<RunKey>,
-    mut on_row: impl FnMut(&Value),
+    mut on_row: impl FnMut(&Value) -> Result<(), String>,
 ) -> Result<Vec<Value>, String> {
     if seeds.is_empty() {
         return Err("seeds must be a non-empty ordered list".into());
@@ -77,7 +79,7 @@ pub fn run_agreement(
                     Some(optimal) => json!(optimal.contains(observation.mv.as_str())),
                     None => Value::Null,
                 };
-                on_row(&row);
+                on_row(&row)?;
                 rows.push(row);
             }
         }
@@ -219,7 +221,8 @@ mod tests {
         let adapters: Vec<Box<dyn EngineAdapter>> = vec![Box::new(RandomAdapter)];
         let mut streamed = 0;
         let rows = run_agreement(&adapters, &payload, &[0, 1, 2], &HashSet::new(), |_| {
-            streamed += 1
+            streamed += 1;
+            Ok(())
         })
         .unwrap();
         // Random is stochastic: 3 seeds × 1 position.
@@ -247,7 +250,7 @@ mod tests {
             "p0".to_string(),
             Some(0u64),
         ));
-        let rows = run_agreement(&adapters, &payload, &[0, 1], &skip, |_| {}).unwrap();
+        let rows = run_agreement(&adapters, &payload, &[0, 1], &skip, |_| Ok(())).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["seed"], json!(1));
     }
@@ -256,6 +259,6 @@ mod tests {
     fn empty_seeds_rejected() {
         let payload = json!({"positions": []});
         let adapters: Vec<Box<dyn EngineAdapter>> = vec![];
-        assert!(run_agreement(&adapters, &payload, &[], &HashSet::new(), |_| {}).is_err());
+        assert!(run_agreement(&adapters, &payload, &[], &HashSet::new(), |_| Ok(())).is_err());
     }
 }

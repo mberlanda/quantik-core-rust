@@ -99,6 +99,48 @@ shape.
 - identical settings and seed reproduce the same move
 - minimax's chosen move matches the head of its principal variation
 
+## Checkpoint And Resume
+
+`run` accepts `--checkpoint <path>` to stream every completed observation
+row and head-to-head game to a JSON Lines file as it happens, and
+`--resume` to continue an interrupted run from that file instead of
+restarting it from scratch. This is a Rust-only addition — the Python
+harness has no equivalent.
+
+```bash
+cargo run --release --bin cross_engine_benchmark -- run \
+  --dataset benchmarks/positions-v1.json --time-limit 1.0 --seeds 30 \
+  --checkpoint benchmarks/results/run.ckpt \
+  --output benchmarks/results/run.json
+# interrupted (Ctrl-C, crash, machine reboot, ...) partway through
+cargo run --release --bin cross_engine_benchmark -- run \
+  --dataset benchmarks/positions-v1.json --time-limit 1.0 --seeds 30 \
+  --checkpoint benchmarks/results/run.ckpt --resume \
+  --output benchmarks/results/run.json
+```
+
+**Crash-safety guarantee:** the checkpoint file is a header line followed
+by one line per completed row/game (`{"kind":"observation","row":{...}}` or
+`{"kind":"h2h","record":{...}}`), each flushed to disk individually. A
+crash can lose at most the single line that was in flight — every line
+written before it is intact, and a truncated trailing line is detected and
+dropped on the next load rather than corrupting the read. Resuming
+re-truncates any such dangling line before appending further, so the file
+never accumulates garbage in its middle.
+
+**Header validation:** the header records `dataset_checksum` (the loaded
+dataset's checksum) and `config_fingerprint` (a sha256 of the run's
+canonical config JSON, excluding the `--output`/`--checkpoint` paths
+themselves — so the same engine settings resumed to a different output
+path still match). `--resume` refuses to proceed if either mismatches the
+current run's dataset or settings, so runs are never silently mixed;
+without `--resume`, `run` refuses to overwrite an existing checkpoint file
+at all. On a successful resumed run, the result bundle's top-level
+`"resumed"` field is `true` (`false` for every non-resumed run), and the
+`observations`/`head_to_head.records` arrays contain the union of the
+checkpoint's rows/games and any newly completed ones — order is not
+preserved, but no row is duplicated or lost.
+
 ## Reproducing A Run
 
 Generate or update the committed dataset artifact:

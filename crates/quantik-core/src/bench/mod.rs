@@ -8,6 +8,7 @@ pub mod adapters;
 pub mod agreement;
 pub mod bundle;
 pub mod canonical;
+pub mod checkpoint;
 pub mod correctness;
 pub mod dataset;
 pub mod head_to_head;

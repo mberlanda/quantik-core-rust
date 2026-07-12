@@ -8,10 +8,11 @@ use clap::{Parser, Subcommand};
 use quantik_core::bench::adapters::{
     fixed_time_adapters, BeamAdapter, EngineAdapter, MCTSAdapter, MinimaxAdapter, RandomAdapter,
 };
-use quantik_core::bench::agreement::{aggregate_agreement, aggregate_cost, run_agreement};
+use quantik_core::bench::agreement::{aggregate_agreement, aggregate_cost, run_agreement, RunKey};
 use quantik_core::bench::bundle::{make_bundle, save_bundle};
+use quantik_core::bench::checkpoint::{self, CheckpointWriter};
 use quantik_core::bench::correctness::run_preflight;
-use quantik_core::bench::head_to_head::{aggregate_head_to_head, run_head_to_head};
+use quantik_core::bench::head_to_head::{aggregate_head_to_head, run_head_to_head, GameKey};
 use quantik_core::bench::report::render_markdown;
 use quantik_core::bench::stability::aggregate_stability;
 use quantik_core::bench::{dataset, reference};
@@ -84,6 +85,17 @@ enum Commands {
         skip_h2h: bool,
         #[arg(long)]
         output: PathBuf,
+        /// Crash-safe JSON Lines checkpoint: streams each completed
+        /// observation/game as it finishes so an interrupted run can be
+        /// resumed instead of restarted from scratch.
+        #[arg(long)]
+        checkpoint: Option<PathBuf>,
+        /// Resume from an existing --checkpoint file (its header must match
+        /// this run's dataset and engine settings). Without this flag, an
+        /// existing checkpoint file is refused rather than silently reused
+        /// or overwritten.
+        #[arg(long, default_value_t = false)]
+        resume: bool,
     },
     /// Render a bundle to Markdown.
     Report {
@@ -164,6 +176,8 @@ fn cmd_run(
     h2h_seed_count: u64,
     skip_h2h: bool,
     output: &Path,
+    checkpoint_path: Option<&Path>,
+    resume: bool,
 ) -> Result<(), String> {
     let payload = dataset::load(dataset_path)?;
     let adapters = build_adapters(&args);
@@ -179,33 +193,10 @@ fn cmd_run(
     }
 
     let seeds: Vec<u64> = (0..seeds_count).map(|i| seed_base + i).collect();
-    let rows = run_agreement(&adapters, &payload, &seeds, &HashSet::new(), |_| {})?;
 
-    let mut h2h_records: Vec<Value> = Vec::new();
-    let mut h2h_aggregates: Vec<Value> = Vec::new();
-    if !skip_h2h {
-        let sampled = h2h_positions(&payload, h2h_position_count);
-        let h2h_seeds: Vec<u64> = (0..h2h_seed_count).map(|i| seed_base + i).collect();
-        for i in 0..adapters.len() {
-            for j in (i + 1)..adapters.len() {
-                let records = run_head_to_head(
-                    adapters[i].as_ref(),
-                    adapters[j].as_ref(),
-                    &sampled,
-                    &h2h_seeds,
-                    &HashSet::new(),
-                    |_| {},
-                )?;
-                h2h_aggregates.push(aggregate_head_to_head(
-                    &records,
-                    adapters[i].name(),
-                    adapters[j].name(),
-                ));
-                h2h_records.extend(records);
-            }
-        }
-    }
-
+    // Config is fixed by the CLI args alone (no run results feed back into
+    // it), so it can be assembled up front and fingerprinted for the
+    // checkpoint header before any engine work starts.
     let config = json!({
         "dataset": dataset_path.to_string_lossy(),
         "family": args.family,
@@ -223,11 +214,103 @@ fn cmd_run(
         "h2h_seeds": h2h_seed_count,
         "skip_h2h": skip_h2h,
         "output": output.to_string_lossy(),
+        "checkpoint": checkpoint_path.map(|p| p.to_string_lossy().to_string()),
         "engine_seeds": seeds,
     });
+    let dataset_checksum = payload["checksum"].as_str().unwrap_or_default().to_string();
+    let config_fingerprint = checkpoint::config_fingerprint(&config);
+
+    let mut checkpoint_writer: Option<CheckpointWriter> = None;
+    let mut loaded_rows: Vec<Value> = Vec::new();
+    let mut loaded_records: Vec<Value> = Vec::new();
+    let mut row_skip: HashSet<RunKey> = HashSet::new();
+    let mut record_skip: HashSet<GameKey> = HashSet::new();
+    let mut resumed = false;
+
+    if let Some(path) = checkpoint_path {
+        if resume {
+            if !path.exists() {
+                return Err(format!(
+                    "--resume requires an existing checkpoint at {}; omit --resume to start a \
+                     fresh run",
+                    path.display()
+                ));
+            }
+            let state = checkpoint::load_checkpoint(path, &dataset_checksum, &config_fingerprint)?;
+            loaded_rows = state.rows;
+            loaded_records = state.records;
+            row_skip = state.row_skip;
+            record_skip = state.record_skip;
+            resumed = true;
+            checkpoint_writer = Some(CheckpointWriter::resume(path)?);
+        } else {
+            checkpoint_writer = Some(CheckpointWriter::create(
+                path,
+                &dataset_checksum,
+                &config_fingerprint,
+            )?);
+        }
+    }
+
+    let fresh_rows =
+        run_agreement(
+            &adapters,
+            &payload,
+            &seeds,
+            &row_skip,
+            |row| match checkpoint_writer.as_mut() {
+                Some(writer) => writer.write_row(row),
+                None => Ok(()),
+            },
+        )?;
+    let mut rows = loaded_rows;
+    rows.extend(fresh_rows);
+
+    let mut h2h_records: Vec<Value> = Vec::new();
+    let mut h2h_aggregates: Vec<Value> = Vec::new();
+    if !skip_h2h {
+        let sampled = h2h_positions(&payload, h2h_position_count);
+        let h2h_seeds: Vec<u64> = (0..h2h_seed_count).map(|i| seed_base + i).collect();
+        for i in 0..adapters.len() {
+            for j in (i + 1)..adapters.len() {
+                let name_i = adapters[i].name();
+                let name_j = adapters[j].name();
+                let fresh = run_head_to_head(
+                    adapters[i].as_ref(),
+                    adapters[j].as_ref(),
+                    &sampled,
+                    &h2h_seeds,
+                    &record_skip,
+                    |record| match checkpoint_writer.as_mut() {
+                        Some(writer) => writer.write_record(record),
+                        None => Ok(()),
+                    },
+                )?;
+                // A checkpoint's h2h records span every pairing, streamed
+                // in one flat file; attribute the loaded ones back to this
+                // specific unordered pair by filtering on {mover,
+                // responder}, mirroring how the per-pair aggregate is
+                // accumulated below for freshly played games.
+                let pair_records: Vec<Value> = loaded_records
+                    .iter()
+                    .filter(|record| {
+                        let mover = record["mover"].as_str().unwrap_or_default();
+                        let responder = record["responder"].as_str().unwrap_or_default();
+                        (mover == name_i && responder == name_j)
+                            || (mover == name_j && responder == name_i)
+                    })
+                    .cloned()
+                    .chain(fresh.iter().cloned())
+                    .collect();
+                h2h_aggregates.push(aggregate_head_to_head(&pair_records, name_i, name_j));
+                h2h_records.extend(fresh);
+            }
+        }
+        h2h_records.extend(loaded_records);
+    }
 
     let games = h2h_records.len();
-    let bundle = make_bundle(
+    let mut bundle = make_bundle(
         config,
         &payload,
         rows.clone(),
@@ -238,12 +321,14 @@ fn cmd_run(
             "stability": aggregate_stability(&rows),
         }),
     );
+    bundle["resumed"] = json!(resumed);
     save_bundle(&bundle, output)?;
     println!(
-        "bundle: {} observations, {} games -> {}",
+        "bundle: {} observations, {} games -> {}{}",
         rows.len(),
         games,
-        output.display()
+        output.display(),
+        if resumed { " (resumed)" } else { "" }
     );
     Ok(())
 }
@@ -334,6 +419,8 @@ fn main() {
             h2h_seeds,
             skip_h2h,
             output,
+            checkpoint,
+            resume,
         } => cmd_run(
             &dataset,
             RunArgs {
@@ -353,6 +440,8 @@ fn main() {
             h2h_seeds,
             skip_h2h,
             &output,
+            checkpoint.as_deref(),
+            resume,
         ),
         Commands::Report { input, output } => cmd_report(&input, output),
     };
