@@ -9,6 +9,7 @@ use quantik_core::bench::adapters::{
     fixed_time_adapters, BeamAdapter, EngineAdapter, MCTSAdapter, MinimaxAdapter, RandomAdapter,
 };
 use quantik_core::bench::agreement::{aggregate_agreement, aggregate_cost, run_agreement, RunKey};
+use quantik_core::bench::book_export;
 use quantik_core::bench::bundle::{make_bundle, save_bundle};
 use quantik_core::bench::checkpoint::{self, CheckpointWriter};
 use quantik_core::bench::correctness::run_preflight;
@@ -16,6 +17,7 @@ use quantik_core::bench::head_to_head::{aggregate_head_to_head, run_head_to_head
 use quantik_core::bench::report::render_markdown;
 use quantik_core::bench::stability::aggregate_stability;
 use quantik_core::bench::{dataset, reference};
+use quantik_core::opening_book::{OpeningBookConfig, OpeningBookDatabase};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -49,6 +51,10 @@ enum Commands {
         solve_budget: f64,
         #[arg(long, default_value = "benchmarks/positions-v1.json")]
         output: PathBuf,
+        /// Optional opening-book SQLite path: solved positions short-
+        /// circuit repeated solves and are persisted for reuse across runs.
+        #[arg(long)]
+        book: Option<PathBuf>,
     },
     /// Run a benchmark family.
     Run {
@@ -104,6 +110,14 @@ enum Commands {
         /// Default: <input>.md
         #[arg(long)]
         output: Option<PathBuf>,
+    },
+    /// Bulk-export solved references from a dataset artifact into an
+    /// opening-book SQLite database.
+    ExportBook {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        db: PathBuf,
     },
 }
 
@@ -350,14 +364,24 @@ fn cmd_run(
     Ok(())
 }
 
+fn open_book(path: &Path) -> Result<OpeningBookDatabase, String> {
+    OpeningBookDatabase::open(&OpeningBookConfig {
+        database_path: path.to_string_lossy().to_string(),
+        ..Default::default()
+    })
+    .map_err(|e| format!("open opening book {path:?}: {e}"))
+}
+
 fn cmd_dataset(
     requested: BTreeMap<String, u32>,
     seed: u64,
     solve_budget: f64,
     output: &Path,
+    book_path: Option<&Path>,
 ) -> Result<(), String> {
     let mut payload = dataset::generate(&requested, seed)?;
-    reference::augment_with_references(&mut payload, solve_budget);
+    let book = book_path.map(open_book).transpose()?;
+    reference::augment_with_references_with_book(&mut payload, solve_budget, book.as_ref());
     let digest = dataset::save(&payload, output)?;
 
     let positions = payload["positions"].as_array().cloned().unwrap_or_default();
@@ -399,6 +423,17 @@ fn cmd_report(input: &Path, output: Option<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_export_book(input: &Path, db_path: &Path) -> Result<(), String> {
+    let payload = dataset::load(input)?;
+    let db = open_book(db_path)?;
+    let inserted = book_export::export_references(&payload, &db)?;
+    println!(
+        "export-book: {inserted} solved references -> {}",
+        db_path.display()
+    );
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -410,6 +445,7 @@ fn main() {
             seed,
             solve_budget,
             output,
+            book,
         } => {
             let requested = BTreeMap::from([
                 ("opening".to_string(), opening),
@@ -417,7 +453,7 @@ fn main() {
                 ("late_mid".to_string(), late_mid),
                 ("endgame".to_string(), endgame),
             ]);
-            cmd_dataset(requested, seed, solve_budget, &output)
+            cmd_dataset(requested, seed, solve_budget, &output, book.as_deref())
         }
         Commands::Run {
             dataset,
@@ -461,6 +497,7 @@ fn main() {
             resume,
         ),
         Commands::Report { input, output } => cmd_report(&input, output),
+        Commands::ExportBook { input, db } => cmd_export_book(&input, &db),
     };
 
     if let Err(message) = result {

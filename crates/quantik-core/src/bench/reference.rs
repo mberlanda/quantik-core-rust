@@ -5,10 +5,12 @@
 //! produced by full-depth minimax and stored only when every child was
 //! solved with no cutoff.
 
+use crate::bench::book_export::lookup_reference;
 use crate::bitboard::Bitboard;
 use crate::game::has_winning_line;
 use crate::minimax::{MinimaxConfig, MinimaxEngine};
 use crate::moves::{apply_move, generate_legal_moves, Move};
+use crate::opening_book::OpeningBookDatabase;
 use crate::state::State;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -120,10 +122,68 @@ pub fn solve_position(bb: &Bitboard, budget_s: f64) -> Option<Value> {
     }))
 }
 
+/// Like [`solve_position`], but first probes `book` (when given) for a
+/// stored solved reference at `bb`'s canonical key, short-circuiting the
+/// minimax solve on a hit. On a fresh solve, the result is written back
+/// through `book` (best-effort — a write failure is silently ignored, the
+/// solve itself already succeeded and is returned regardless).
+///
+/// See [`crate::bench::book_export`] for the orientation caveat: both the
+/// lookup and the write-back apply only when `bb` is its own canonical
+/// representative — the stored moves are in that one orientation and
+/// cannot be translated across symmetries yet.
+pub fn solve_position_with_book(
+    bb: &Bitboard,
+    budget_s: f64,
+    book: Option<&OpeningBookDatabase>,
+) -> Option<Value> {
+    if let Some(db) = book {
+        if let Some(hit) = lookup_reference(bb, db) {
+            return Some(hit);
+        }
+    }
+
+    let reference = solve_position(bb, budget_s)?;
+
+    // Write-side orientation guard, symmetric with lookup_reference's
+    // read-side guard: only canonical representatives may be stored
+    // (add_solved_position enforces this too, as defense in depth).
+    if let Some(db) = book {
+        if State::new(*bb).canonical_payload() == bb.to_le_bytes() {
+            let value = reference["value"].as_i64().unwrap_or(0) as i32;
+            if let Some(optimal_moves) = reference["optimal_moves"].as_array() {
+                let parsed: Result<Vec<(i32, i32)>, String> = optimal_moves
+                    .iter()
+                    .map(|v| {
+                        let key = v.as_str().ok_or("optimal_moves entry is not a string")?;
+                        let (_, shape, pos) = parse_move_key(key)?;
+                        Ok((shape as i32, pos as i32))
+                    })
+                    .collect();
+                if let Ok(optimal_moves) = parsed {
+                    let _ = db.add_solved_position(&State::new(*bb), value, &optimal_moves);
+                }
+            }
+        }
+    }
+
+    Some(reference)
+}
+
 /// Fill reference fields in place; the `opening` phase is skipped (its
 /// positions are too expensive to solve and never contribute to exact
 /// move-agreement figures).
 pub fn augment_with_references(payload: &mut Value, budget_s: f64) {
+    augment_with_references_with_book(payload, budget_s, None);
+}
+
+/// Like [`augment_with_references`], but reads through (and writes back
+/// into) `book` when given — see [`solve_position_with_book`].
+pub fn augment_with_references_with_book(
+    payload: &mut Value,
+    budget_s: f64,
+    book: Option<&OpeningBookDatabase>,
+) {
     let Some(positions) = payload.get_mut("positions").and_then(Value::as_array_mut) else {
         return;
     };
@@ -135,7 +195,8 @@ pub fn augment_with_references(payload: &mut Value, budget_s: f64) {
         let bb = State::from_qfen(position["qfen"].as_str().unwrap_or_default())
             .map(|s| s.bb)
             .unwrap_or(Bitboard::EMPTY);
-        position["reference"] = solve_position(&bb, budget_s).unwrap_or(Value::Null);
+        position["reference"] =
+            solve_position_with_book(&bb, budget_s, book).unwrap_or(Value::Null);
     }
 }
 
@@ -223,5 +284,68 @@ mod tests {
         }
         let value = reference["value"].as_i64().unwrap();
         assert!(value == 1 || value == -1);
+    }
+
+    fn temp_book_path(tag: &str) -> std::path::PathBuf {
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("quantik_ref_book_{tag}_{id}.db"))
+    }
+
+    fn open_book(path: &std::path::Path) -> crate::opening_book::OpeningBookDatabase {
+        crate::opening_book::OpeningBookDatabase::open(&crate::opening_book::OpeningBookConfig {
+            database_path: path.to_string_lossy().to_string(),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn solve_position_with_book_short_circuits_canonical_positions() {
+        // A canonical-representative position: after the first solve
+        // writes it back, a second lookup must hit the book (solver ==
+        // "opening-book", nodes == 0) instead of re-solving.
+        let bb = (0u64..)
+            .map(|seed| random_position(seed, 11))
+            .find(|bb| State::new(*bb).canonical_payload() == bb.to_le_bytes())
+            .expect("a canonical-representative position exists among random samples");
+
+        let path = temp_book_path("short-circuit");
+        let db = open_book(&path);
+
+        let first = solve_position_with_book(&bb, 60.0, Some(&db)).unwrap();
+        assert_ne!(first["solver"], json!("opening-book"));
+
+        let second = solve_position_with_book(&bb, 60.0, Some(&db)).unwrap();
+        assert_eq!(second["solver"], json!("opening-book"));
+        assert_eq!(second["nodes"], json!(0));
+        assert_eq!(second["value"], first["value"]);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn solve_position_with_book_never_short_circuits_non_canonical_positions() {
+        // A non-canonical-orientation position: the book guard requires
+        // the QUERY itself to be its own canonical representative, so
+        // lookups here must always fall through to a fresh minimax solve,
+        // even after a write-back.
+        let bb = (0u64..)
+            .map(|seed| random_position(seed, 11))
+            .find(|bb| State::new(*bb).canonical_payload() != bb.to_le_bytes())
+            .expect("a non-canonical position exists among random samples");
+
+        let path = temp_book_path("no-short-circuit");
+        let db = open_book(&path);
+
+        let first = solve_position_with_book(&bb, 60.0, Some(&db)).unwrap();
+        assert_ne!(first["solver"], json!("opening-book"));
+
+        let second = solve_position_with_book(&bb, 60.0, Some(&db)).unwrap();
+        assert_ne!(second["solver"], json!("opening-book"));
+
+        std::fs::remove_file(&path).ok();
     }
 }
