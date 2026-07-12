@@ -5,8 +5,13 @@
 //! consistent conditions. See `docs/BENCHMARKS.md`.
 
 pub mod adapters;
+pub mod agreement;
+pub mod bundle;
 pub mod canonical;
 pub mod correctness;
 pub mod dataset;
+pub mod head_to_head;
 pub mod metrics;
 pub mod reference;
+pub mod report;
+pub mod stability;
