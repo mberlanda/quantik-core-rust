@@ -150,6 +150,65 @@ pub fn canonical_json(value: &Value) -> String {
     out
 }
 
+/// Write one indentation level (`indent` spaces per `level`) into `out`.
+fn write_indent(indent: usize, level: usize, out: &mut String) {
+    out.extend(std::iter::repeat_n(' ', indent * level));
+}
+
+fn write_value_pretty(value: &Value, indent: usize, level: usize, out: &mut String) {
+    match value {
+        Value::Object(map) => {
+            if map.is_empty() {
+                out.push_str("{}");
+                return;
+            }
+            out.push_str("{\n");
+            let last = map.len() - 1;
+            for (i, (key, item)) in map.iter().enumerate() {
+                write_indent(indent, level + 1, out);
+                escape_string(key, out);
+                out.push_str(": ");
+                write_value_pretty(item, indent, level + 1, out);
+                if i != last {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            write_indent(indent, level, out);
+            out.push('}');
+        }
+        Value::Array(items) => {
+            if items.is_empty() {
+                out.push_str("[]");
+                return;
+            }
+            out.push_str("[\n");
+            let last = items.len() - 1;
+            for (i, item) in items.iter().enumerate() {
+                write_indent(indent, level + 1, out);
+                write_value_pretty(item, indent, level + 1, out);
+                if i != last {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            write_indent(indent, level, out);
+            out.push(']');
+        }
+        scalar => write_value(scalar, out),
+    }
+}
+
+/// Serialize `value` exactly as Python's
+/// `json.dumps(value, indent=2, sort_keys=True) + "\n"` — used for the
+/// checkpoint manifest, which humans read directly.
+pub fn canonical_json_pretty(value: &Value) -> String {
+    let mut out = String::new();
+    write_value_pretty(value, 2, 0, &mut out);
+    out.push('\n');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +248,23 @@ mod tests {
             canonical_json(&value),
             r#"{"a":{"nested":"ok","t":4.7e-05},"b":[1,2.5,null,true]}"#
         );
+    }
+
+    #[test]
+    fn pretty_matches_python_indent2_layout() {
+        // CPython: json.dumps({"b": [1, {"z": 1, "a": 2}], "a": {}}, indent=2,
+        //                     sort_keys=True) + "\n"
+        let value = json!({"b": [1, {"z": 1, "a": 2}], "a": {}});
+        assert_eq!(
+            canonical_json_pretty(&value),
+            "{\n  \"a\": {},\n  \"b\": [\n    1,\n    {\n      \"a\": 2,\n      \"z\": 1\n    }\n  ]\n}\n"
+        );
+    }
+
+    #[test]
+    fn pretty_empty_object_and_array() {
+        assert_eq!(canonical_json_pretty(&json!({})), "{}\n");
+        assert_eq!(canonical_json_pretty(&json!([])), "[]\n");
     }
 
     #[test]

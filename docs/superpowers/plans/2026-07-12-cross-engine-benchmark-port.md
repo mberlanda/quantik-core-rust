@@ -570,3 +570,120 @@ cross-language"):
 - Types are consistent: `Move{player,shape,position}: u8`, canonical key
   `[u8;18]`, move key string `p:s:pos`, observation field names match the
   Python `asdict` output exactly (JSON: `move`, not `mv`).
+
+---
+
+### Task 11 (PR): Align checkpoints with the updated Python worktree — directory format, partial reports, workers, preflight progress
+
+The Python worktree gained (commits 2f7179f..7241126, 2026-07-12): a
+directory-based resumable checkpoint system, partial-state reporting,
+parallel workers, and preflight progress. Port them, REPLACING the Rust
+single-file `.ckpt` format from PR #10 with the Python-compatible layout
+(cross-language: a Rust-written checkpoint dir must rehydrate/report from
+Python and vice versa — resume VALIDATION stays intra-language because the
+config dicts differ across implementations; document that).
+
+Python reference (authoritative): `$PY/benchmarks/checkpoint.py`,
+`$PY/benchmarks/agreement.py` (iter_agreement + workers),
+`$PY/benchmarks/head_to_head.py` (iter_head_to_head + workers),
+`$PY/examples/cross_engine_benchmark.py` (CLI wiring, progress lines,
+resume flows), `$PY/benchmarks/report.py` (checkpoint block),
+`$PY/docs/BENCHMARKS.md` (new sections), tests in
+`$PY/tests/test_benchmark_checkpoint.py`.
+
+**Files:** rewrite `crates/quantik-core/src/bench/checkpoint.rs`; modify
+`agreement.rs`, `head_to_head.rs`, `report.rs`, `bundle.rs` (checkpoint
+block passthrough), `bin/cross_engine_benchmark.rs`, `docs/BENCHMARKS.md`,
+`Cargo.toml` (+rayon).
+
+**Checkpoint directory layout (byte-compatible with Python):**
+- `manifest.json` — pretty (indent 2) sorted-key JSON + `\n`, written
+  ATOMICALLY (write `manifest.json.tmp`, rename). Fields: schema_version,
+  started_at (%Y-%m-%dT%H:%M:%S%z), environment, config (full run config
+  incl. engine_seeds), dataset summary {checksum, generator, seed,
+  schema_version, positions, phases}, status
+  ("preflight"|"running"|"complete"|"preflight_failed"), counts
+  {observations, h2h_records}, updated_at (set by count updates).
+- `observations.jsonl`, `h2h.jsonl` — one row per line, compact sorted-key
+  JSON (use `bench::canonical::canonical_json` for byte parity), append +
+  flush per line. Blank lines skipped on load; an INVALID line is an ERROR
+  with file:line (Python raises — no truncated-tail tolerance in this
+  format; the atomic manifest is the integrity anchor).
+- Resume keys: observation `(position_id, engine, config_label, seed)`;
+  h2h `(position_id, mover, responder, seed)`.
+- Resume validation (`validate_resume_manifest`): dataset checksum equal;
+  normalized config signature equal, where normalization drops
+  {checkpoint_dir, output, resume, workers} (and skip_h2h when
+  `allow_skip_h2h_mismatch` — allowed only when existing h2h records ==
+  expected count). Mismatch => per-key diff in the error message.
+- `bundle_from_checkpoint(dir)`: rehydrate manifest + JSONL into a full
+  bundle (recompute aggregates; group h2h aggregates per unordered pair in
+  first-seen order, name order = first record's (mover, responder));
+  bundle gains a `"checkpoint": {status, counts}` block.
+
+**CLI changes (`run`):** remove `--checkpoint`/old `--resume` semantics;
+add `--checkpoint-dir <dir>`, `--resume`, `--checkpoint-every <N>`
+(default 1; manifest count update + progress line every N completed rows),
+`--workers <N>` (default 1; error if < 1). Fresh (non-resume) with
+--checkpoint-dir: mkdir -p, truncate both JSONL files, write manifest with
+status "preflight". Resume: manifest must exist (else "RESUME FAILED -
+checkpoint manifest not found"), load both JSONL files, skip-key sets,
+h2h completeness check when --skip-h2h, validate manifest. Preflight
+failure updates manifest status to "preflight_failed" (with current
+counts) before exiting 1. On completion set status "complete" and build
+the bundle VIA bundle_from_checkpoint when checkpointing (non-checkpoint
+runs keep make_bundle). Progress lines (stdout, flush): mirror Python's
+"preflight: checking N adapters across M sample positions", "preflight:
+passed", "agreement: X/Y observations complete; workers=N; checkpoint
+<path>", "... observations checkpointed", "h2h: X/Y games ...".
+`report --input <dir>`: if the input is a directory, rehydrate via
+bundle_from_checkpoint (partial state reports fine); report shows
+"- checkpoint status: ..." and "- checkpoint counts: observations N,
+h2h_records M" lines after "started:" when the block is present.
+
+**Parallel workers:** EngineAdapter gains `Send + Sync` bounds (all
+implementors are stateless). Task lists built exactly like Python
+(_agreement_tasks ordering; skip keys filtered up front). workers == 1:
+serial iteration identical to today. workers > 1: rayon pool sized to N
+(`ThreadPoolBuilder::num_threads`), results yielded IN TASK ORDER
+(par_iter + collect preserves order; then stream to checkpoint/bundle in
+that order). Same for h2h games per pair. Progress counting unaffected.
+NOTE: an adapter select error inside a worker must propagate as the run
+error (fail the run, manifest keeps last counts).
+
+**Tests** (port the shapes of `$PY/tests/test_benchmark_checkpoint.py` +
+new parallel tests): manifest atomic write + counts update + status
+transitions; resume validation (checksum mismatch, config diff message,
+skip_h2h allowance only when complete); bundle_from_checkpoint on a
+partial dir (counts + checkpoint block + aggregates from partial rows);
+report on a checkpoint dir contains the checkpoint status line; workers=2
+agreement rows equal workers=1 rows EXACTLY (same order, same content;
+golden dataset subset + cheap adapters, seeds [0,1]); h2h workers=2 ==
+workers=1; resume-after-interrupt multiset equality (adapted from the
+existing PR #10 test); invalid JSONL line errors with line number.
+Keep debug test time < 30s.
+
+- [x] Steps: implement → gates → commit `feat: align benchmark checkpoints with Python directory format, add workers` → push → PR → Opus review → merge.
+  NOTE (2026-07-12): implementation finished — `bench::checkpoint` rewritten
+  for the Python-compatible directory format (`manifest.json` atomic
+  tmp+rename pretty JSON, `observations.jsonl`/`h2h.jsonl` compact
+  canonical JSONL, `build_manifest`/`validate_resume_manifest`/
+  `update_manifest_counts`/`bundle_from_checkpoint`), `agreement.rs`/
+  `head_to_head.rs` refactored to explicit task lists with a `workers`
+  parameter (rayon pool, `par_iter().collect()` preserving order, streamed
+  to callbacks in task order), `EngineAdapter: Send + Sync`, `report.rs`
+  renders the checkpoint status/counts block, CLI `run` gained
+  `--checkpoint-dir`/`--checkpoint-every`/`--workers` and lost the old
+  `--checkpoint` single-file flag, `report --input <dir>` rehydrates via
+  `bundle_from_checkpoint`. fmt/clippy/test/release gates green (135
+  workspace tests). Smoke-verified manually against the real CLI: a
+  checkpointed run, `report --input <dir>` on the live directory, a
+  `--resume` rerun that skipped all completed work, a mismatched-config
+  resume correctly refused, a missing-manifest resume correctly refused,
+  and workers=1 vs workers=4 producing identical h2h records and
+  identical non-timing observation fields (deep, wall-clock-time-limited
+  minimax searches can legitimately reach different `depth_reached` under
+  real thread contention — documented in `docs/BENCHMARKS.md` as inherent
+  to wall-clock deadlines under parallelism, not a task-ordering bug).
+  Deviation: the Rust-only `bundle["resumed"]` boolean from PR #10 was
+  dropped (no Python equivalent); the `"checkpoint"` block supersedes it.
