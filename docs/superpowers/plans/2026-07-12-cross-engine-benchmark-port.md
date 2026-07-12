@@ -49,7 +49,7 @@ serde/serde_json) plus `sha2` (checksums) and `chrono` (timestamps).
 | 6 reference solver + adapters + preflight | #8 | MERGED |
 | 7 aggregation + h2h + bundle + report + CLI | #9 | MERGED |
 | 8 checkpoint/resume | #10 | MERGED |
-| 9 opening-book persistence | — | TODO |
+| 9 opening-book persistence | #11 | IN REVIEW: PR #11 open |
 | 10 changelog/docs + full benchmark run | — | TODO |
 
 ## Delegation Protocol (subagent-driven from Task 7 onward)
