@@ -50,7 +50,7 @@ serde/serde_json) plus `sha2` (checksums) and `chrono` (timestamps).
 | 7 aggregation + h2h + bundle + report + CLI | #9 | MERGED |
 | 8 checkpoint/resume | #10 | MERGED |
 | 9 opening-book persistence | #11 | MERGED |
-| 10 changelog/docs + full benchmark run | — | TODO |
+| 10 changelog/docs + full benchmark run | #12 | MERGED; full fixed-1s-seeds30 run completed 2026-07-12, report on PR #12 |
 
 ## Delegation Protocol (subagent-driven from Task 7 onward)
 
@@ -548,7 +548,7 @@ cross-language"):
 - Create: `CHANGELOG.md` (mirror the ported Unreleased entries from `$PY/CHANGELOG.md`, adapted)
 - Modify: `README.md` (benchmark section pointing to docs/BENCHMARKS.md)
 
-- [ ] Run the real benchmark overnight:
+- [x] Run the real benchmark overnight (completed 2026-07-12: 3276 observations, 1440 games; interrupted once, resumed via checkpoint; report attached to PR #12):
   `cargo run --release --bin cross_engine_benchmark -- run --dataset benchmarks/positions-v1.json --family fixed --time-limit 1.0 --seeds 30 --h2h-positions 12 --h2h-seeds 10 --checkpoint benchmarks/results/fixed-1s-seeds30.ckpt --output benchmarks/results/fixed-1s-seeds30.json`
   then `… report --input benchmarks/results/fixed-1s-seeds30.json`; attach the
   Markdown to the final PR description (results dir is gitignored).
