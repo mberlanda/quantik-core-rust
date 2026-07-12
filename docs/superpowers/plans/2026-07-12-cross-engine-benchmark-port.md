@@ -49,7 +49,7 @@ serde/serde_json) plus `sha2` (checksums) and `chrono` (timestamps).
 | 6 reference solver + adapters + preflight | #8 | MERGED |
 | 7 aggregation + h2h + bundle + report + CLI | #9 | MERGED |
 | 8 checkpoint/resume | #10 | MERGED |
-| 9 opening-book persistence | #11 | IN REVIEW: PR #11 open |
+| 9 opening-book persistence | #11 | MERGED |
 | 10 changelog/docs + full benchmark run | — | TODO |
 
 ## Delegation Protocol (subagent-driven from Task 7 onward)
@@ -552,7 +552,7 @@ cross-language"):
   `cargo run --release --bin cross_engine_benchmark -- run --dataset benchmarks/positions-v1.json --family fixed --time-limit 1.0 --seeds 30 --h2h-positions 12 --h2h-seeds 10 --checkpoint benchmarks/results/fixed-1s-seeds30.ckpt --output benchmarks/results/fixed-1s-seeds30.json`
   then `… report --input benchmarks/results/fixed-1s-seeds30.json`; attach the
   Markdown to the final PR description (results dir is gitignored).
-- [ ] Commit `docs: add changelog and benchmark documentation`, final PR, merge.
+- [x] Commit `docs: add changelog and benchmark documentation`, final PR, merge.
 
 ## Self-Review Notes
 

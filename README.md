@@ -252,6 +252,26 @@ cargo build --release
 cargo test
 ```
 
+## Cross-Engine Benchmarks
+
+The `cross_engine_benchmark` binary compares `MinimaxEngine`, `MCTSEngine`,
+`BeamSearchEngine`, and a uniform-random baseline on a shared, checksummed
+position dataset with exact references, correctness preflight, agreement/
+cost/stability/head-to-head aggregation, and generated Markdown reports. It
+reproduces the Python `examples/cross_engine_benchmark.py` harness and adds
+crash-safe checkpoint/resume plus opening-book persistence of solved
+references. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full
+methodology.
+
+```sh
+cargo run --release --bin cross_engine_benchmark -- run \
+  --dataset benchmarks/positions-v1.json --time-limit 1.0 --seeds 30 \
+  --checkpoint benchmarks/results/run.ckpt \
+  --output benchmarks/results/run.json
+cargo run --release --bin cross_engine_benchmark -- report \
+  --input benchmarks/results/run.json
+```
+
 ## IDDFS Opening Book Builder
 
 The `bench_bfs` binary builds an opening book using hybrid iterative-deepening
