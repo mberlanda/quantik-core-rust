@@ -131,10 +131,12 @@ fn play_h2h_task(task: &H2hTask) -> Result<Value, String> {
 ///
 /// `workers` follows the same contract as
 /// [`super::agreement::run_agreement`]: `workers == 1` is serial;
-/// `workers > 1` runs the task list on a sized rayon pool via
-/// `par_iter().collect()` (order-preserving) and streams the results to
-/// `on_record` in task order, so results are byte-identical to a
-/// `workers == 1` run.
+/// `workers > 1` processes the ordered task list in sequential chunks of
+/// `workers` tasks on a sized rayon pool — each chunk computed in parallel
+/// via `par_iter().collect()` (order-preserving), then streamed to
+/// `on_record` in task order before the next chunk starts — so results are
+/// byte-identical to a `workers == 1` run while still checkpointing
+/// incrementally (at most one chunk of in-flight work is lost on a crash).
 pub fn run_head_to_head(
     adapter_a: &dyn EngineAdapter,
     adapter_b: &dyn EngineAdapter,
@@ -165,12 +167,19 @@ pub fn run_head_to_head(
             .num_threads(workers)
             .build()
             .map_err(|e| format!("build worker pool: {e}"))?;
-        let results: Vec<Result<Value, String>> =
-            pool.install(|| tasks.par_iter().map(play_h2h_task).collect());
-        for result in results {
-            let record = result?;
-            on_record(&record)?;
-            records.push(record);
+        // Process the ordered task list in sequential chunks of `workers`
+        // tasks: each chunk is computed in parallel, then its records are
+        // streamed to `on_record` in task order before the next chunk
+        // starts. This keeps checkpoint durability incremental even under
+        // parallelism — a crash loses at most one in-flight chunk instead
+        // of the entire phase (see PR review finding M1).
+        for chunk in tasks.chunks(workers) {
+            let chunk_records: Result<Vec<Value>, String> =
+                pool.install(|| chunk.par_iter().map(play_h2h_task).collect());
+            for record in chunk_records? {
+                on_record(&record)?;
+                records.push(record);
+            }
         }
     }
     Ok(records)

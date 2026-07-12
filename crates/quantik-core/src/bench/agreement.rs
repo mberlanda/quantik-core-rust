@@ -106,12 +106,17 @@ fn select_agreement_row(task: &AgreementTask) -> Result<Value, String> {
 ///
 /// `workers == 1` runs the task list serially (identical to the original
 /// single-threaded behavior). `workers > 1` builds a rayon pool sized to
-/// `workers`, runs every task in parallel via `par_iter().collect()` (which
-/// preserves task order in the result `Vec`), then streams the results to
-/// `on_row` in that same order — so the produced rows and their order are
-/// byte-identical to a `workers == 1` run regardless of worker count. An
-/// adapter error inside a worker surfaces as the first `Err` encountered
-/// while streaming, failing the run.
+/// `workers` and processes the ordered task list in sequential chunks of
+/// `workers` tasks: each chunk runs in parallel via `par_iter().collect()`
+/// (which preserves task order in the result `Vec`), and its rows are
+/// streamed to `on_row` — in task order — before the next chunk starts.
+/// Because chunks are sequential and each chunk preserves task order, the
+/// produced rows and their order are byte-identical to a `workers == 1` run
+/// regardless of worker count, while still delivering rows to the
+/// checkpoint callback incrementally (at most one chunk of in-flight work
+/// is lost on a crash, instead of the whole phase). An adapter error inside
+/// a chunk fails that chunk (and the run) immediately, but rows from
+/// previously completed chunks have already reached `on_row`.
 pub fn run_agreement(
     adapters: &[Box<dyn EngineAdapter>],
     payload: &Value,
@@ -144,12 +149,19 @@ pub fn run_agreement(
             .num_threads(workers)
             .build()
             .map_err(|e| format!("build worker pool: {e}"))?;
-        let results: Vec<Result<Value, String>> =
-            pool.install(|| tasks.par_iter().map(select_agreement_row).collect());
-        for result in results {
-            let row = result?;
-            on_row(&row)?;
-            rows.push(row);
+        // Process the ordered task list in sequential chunks of `workers`
+        // tasks: each chunk is computed in parallel, then its rows are
+        // streamed to `on_row` in task order before the next chunk starts.
+        // This keeps checkpoint durability incremental even under
+        // parallelism — a crash loses at most one in-flight chunk instead
+        // of the entire phase (see PR review finding M1).
+        for chunk in tasks.chunks(workers) {
+            let chunk_rows: Result<Vec<Value>, String> =
+                pool.install(|| chunk.par_iter().map(select_agreement_row).collect());
+            for row in chunk_rows? {
+                on_row(&row)?;
+                rows.push(row);
+            }
         }
     }
 
@@ -237,7 +249,9 @@ pub fn aggregate_cost(rows: &[Value]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bench::adapters::{MinimaxAdapter, RandomAdapter};
+    use crate::bench::adapters::{MinimaxAdapter, RandomAdapter, RawMetrics};
+    use crate::bitboard::Bitboard;
+    use crate::moves::{generate_legal_moves, Move};
 
     fn fixture_rows() -> Vec<Value> {
         vec![
@@ -402,6 +416,123 @@ mod tests {
             strip_timing(&serial),
             strip_timing(&parallel),
             "workers=2 must match workers=1 exactly (ignoring measured timing)"
+        );
+    }
+
+    /// Stochastic test adapter that counts every `select_raw` invocation in
+    /// a shared atomic counter (so a test can observe how many tasks have
+    /// actually been computed at a given point) and fails for one specific
+    /// seed, so a regression test can force a task deep in the ordered
+    /// task list to error deterministically.
+    struct CountingFailAtSeedAdapter {
+        computed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        fail_seed: u64,
+    }
+
+    impl EngineAdapter for CountingFailAtSeedAdapter {
+        fn name(&self) -> &'static str {
+            "counting_failtest"
+        }
+        fn stochastic(&self) -> bool {
+            true
+        }
+        fn config_label(&self) -> String {
+            "counting_failtest".into()
+        }
+        fn select_raw(
+            &self,
+            bb: &Bitboard,
+            seed: Option<u64>,
+        ) -> Result<(Move, RawMetrics), String> {
+            self.computed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if seed == Some(self.fail_seed) {
+                return Err("intentional test failure".into());
+            }
+            let moves = generate_legal_moves(bb);
+            Ok((moves[0], RawMetrics::default()))
+        }
+    }
+
+    /// Regression test for M1: under `workers > 1`, rows must reach
+    /// `on_row` chunk by chunk — not only after the ENTIRE task list
+    /// (including tasks the run never gets to) has finished computing.
+    ///
+    /// One position with a single stochastic adapter and 6 seeds produces
+    /// 6 ordered tasks (seed 0..5); with `workers = 2` these split into 3
+    /// sequential chunks of 2 tasks each: `[0,1]`, `[2,3]`, `[4,5]`. The
+    /// adapter fails on seed 4 (the 5th task, in the last chunk), so the
+    /// run must return `Err`, but the first two chunks (seeds 0..3, 4
+    /// rows) must already have reached `on_row` beforehand — that's the
+    /// checkpoint-durability guarantee (see PR review finding M1).
+    ///
+    /// The test also asserts a structural, non-racy fact that pins down
+    /// *why* this holds, not just the end state: at the moment `on_row`
+    /// fires for the very first row, the shared `computed` counter must
+    /// read exactly 2 (only chunk 1's own two tasks have run). Against the
+    /// OLD `pool.install(|| tasks.par_iter().collect())` implementation —
+    /// which computes and collects results for the WHOLE task list inside
+    /// one `pool.install` call before the first `on_row` is ever invoked —
+    /// that counter would already read 6 (every task, including the
+    /// seed-4 failure and the never-delivered seed-5 success) by the time
+    /// `on_row` is first called, deterministically failing this assertion.
+    /// This isn't a timing race: `pool.install(|| ...collect())` cannot
+    /// return control to the caller until every item in the parallel
+    /// iterator has been computed, so the counter value at first delivery
+    /// is a structural property of which implementation is in use, not a
+    /// coincidence of scheduling.
+    #[test]
+    fn workers_parallel_streams_completed_chunks_before_later_chunk_error() {
+        let payload = json!({
+            "positions": [
+                {"id": "p0", "qfen": "..../..../..../....", "phase": "opening", "reference": null},
+            ]
+        });
+        let computed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let adapters: Vec<Box<dyn EngineAdapter>> = vec![Box::new(CountingFailAtSeedAdapter {
+            computed: computed.clone(),
+            fail_seed: 4,
+        })];
+        let seeds = [0u64, 1, 2, 3, 4, 5];
+
+        let mut streamed_rows: Vec<Value> = Vec::new();
+        let mut computed_at_first_delivery = None;
+        let result = run_agreement(&adapters, &payload, &seeds, &HashSet::new(), 2, |row| {
+            if computed_at_first_delivery.is_none() {
+                computed_at_first_delivery =
+                    Some(computed.load(std::sync::atomic::Ordering::SeqCst));
+            }
+            streamed_rows.push(row.clone());
+            Ok(())
+        });
+
+        assert!(
+            result.is_err(),
+            "run must fail: task for seed 4 errors inside its chunk"
+        );
+        assert!(
+            streamed_rows.len() >= 4,
+            "rows from chunks completed before the failing chunk must already be \
+             streamed to on_row; got {} rows",
+            streamed_rows.len()
+        );
+        let streamed_seeds: Vec<u64> = streamed_rows
+            .iter()
+            .map(|row| row["seed"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            streamed_seeds,
+            vec![0, 1, 2, 3],
+            "exactly the two completed chunks (seeds 0..3) must have reached on_row, \
+             in task order, before the failing chunk aborted the run"
+        );
+        assert_eq!(
+            computed_at_first_delivery,
+            Some(2),
+            "on_row for the first row must fire after only its own chunk (2 tasks) \
+             has been computed, not after the whole task list (this is what an \
+             implementation that collects the entire task list before streaming \
+             any row would violate)"
         );
     }
 }

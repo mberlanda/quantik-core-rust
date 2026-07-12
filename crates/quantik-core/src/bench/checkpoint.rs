@@ -224,7 +224,12 @@ fn config_signature(config: &Value, ignore_skip_h2h: bool) -> Value {
     signature
 }
 
-/// Build a fresh checkpoint manifest (mirrors Python's `_build_manifest`).
+/// Build a fresh checkpoint manifest (mirrors Python CLI's
+/// `_checkpoint_manifest` in `examples/cross_engine_benchmark.py`, not the
+/// library-level `_build_manifest` in `benchmarks/checkpoint.py` — the CLI
+/// manifest intentionally omits `schema_version`; that key only lives on
+/// the bundle produced by `bundle_from_checkpoint`, from the
+/// `bundle::SCHEMA_VERSION` constant).
 pub fn build_manifest(
     config: &Value,
     dataset_payload: &Value,
@@ -243,7 +248,6 @@ pub fn build_manifest(
         phases.insert(phase, json!(count + 1));
     }
     json!({
-        "schema_version": bundle::SCHEMA_VERSION,
         "started_at": now_timestamp(),
         "environment": bundle::collect_environment(),
         "config": config,

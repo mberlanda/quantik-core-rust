@@ -212,15 +212,19 @@ The task list (every `(adapter, position, seed)` unit for agreement, every
 `(mover, responder, position, seed)` unit for head-to-head, in the same
 order Python's `_agreement_tasks`/`_h2h_tasks` iterate) is built up front,
 skip-filtered for anything already in the checkpoint, then either run
-serially (`workers == 1`) or dispatched to the pool via
+serially (`workers == 1`) or processed in sequential chunks of `workers`
+tasks (`workers > 1`): each chunk is dispatched to the pool via
 `par_iter().collect()` — which preserves input order in its result
-`Vec` — and streamed to the checkpoint/bundle in that same order
-afterward. Because of this, **`--workers N` produces results in the exact
-same order, and (for adapters whose behavior doesn't depend on real
-wall-clock CPU time) the exact same content, as `--workers 1`** — it is a
-throughput knob, not a source of nondeterminism in run structure. An
-adapter error inside a worker fails the whole run, exactly as it would
-serially; the checkpoint keeps whatever it had already written.
+`Vec` — and its rows are streamed to the checkpoint/bundle, in order,
+before the next chunk starts. Because of this, **`--workers N` produces
+results in the exact same order, and (for adapters whose behavior doesn't
+depend on real wall-clock CPU time) the exact same content, as
+`--workers 1`** — it is a throughput knob, not a source of nondeterminism
+in run structure. An adapter error inside a chunk fails the whole run,
+exactly as it would serially, but rows from previously completed chunks
+have already been checkpointed — parallel runs checkpoint per
+worker-sized chunk, so a crash mid-phase loses at most one chunk of
+in-flight work rather than the whole phase.
 
 **Caveat for wall-clock time-limited adapters:** `--time-limit`
 (fixed family), `--minimax-time`, and any other engine setting that bounds
@@ -234,6 +238,13 @@ variance a busy machine introduces between two serial runs. This is a
 property of wall-clock deadlines under real parallelism, not a bug in
 task ordering; the order and adapter/position/seed identity of every row
 are unaffected.
+
+**Known remaining parity gaps (follow-ups, not blocking):** the Python
+CLI's `--skip-agreement` and `--track-memory` flags have no Rust
+equivalent yet, so `peak_memory_bytes` is always `null` in Rust-produced
+rows. Failure output also differs cosmetically: Rust prints run failures
+to stderr with an `error:` prefix, while Python prints the equivalent
+failure to stdout.
 
 ## Opening Book Persistence
 
