@@ -37,6 +37,63 @@ serde/serde_json) plus `sha2` (checksums) and `chrono` (timestamps).
 - `$PY/benchmarks/positions-v1.json` — shared dataset artifact (copy into this repo)
 - `$PY/CHANGELOG.md` Unreleased section — the feature/bugfix inventory being ported
 
+## Progress Ledger (updated as tasks merge)
+
+| Task | PR | Status |
+|---|---|---|
+| 1 evaluation module | #3 | MERGED |
+| 2 minimax engine | #4 | MERGED |
+| 3 MCTS fixes (UCB perspective, time limit, TT flag) | #5 | MERGED |
+| 4 beam search engine | #6 | MERGED |
+| 5 bench foundations (metrics, dataset, canonical JSON) | #7 | MERGED |
+| 6 reference solver + adapters + preflight | #8 | MERGED |
+| 7 aggregation + h2h + bundle + report + CLI | — | IN REVIEW: implemented on branch `feat/bench-cli`, gates green, PR open |
+| 8 checkpoint/resume | — | TODO (hooks already in run_agreement/run_head_to_head signatures: `skip` set + `on_row` callback) |
+| 9 opening-book persistence | — | TODO |
+| 10 changelog/docs + full benchmark run | — | TODO |
+
+## Delegation Protocol (subagent-driven from Task 7 onward)
+
+Implementation is delegated to **Sonnet** subagents; each finished PR is
+reviewed by an **Opus** subagent before merge. Orchestrator merges.
+
+**Implementation subagent contract** (one task per agent):
+1. Work in `/Users/mauroberlanda/Code/quantik-ns/quantik-core-rust` on the
+   task's feature branch (branch from up-to-date `main` unless told the
+   branch exists).
+2. Follow this plan's task section EXACTLY; the Python sources under
+   `$PY` (see header) are the authoritative semantics. Do not redesign.
+3. Quality gates before committing — all must pass locally:
+   `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+   --all-features -- -D warnings`, `cargo test --workspace`,
+   `cargo build --workspace --all-targets --release`. If Cargo.toml
+   changed, run a plain `cargo build` first so Cargo.lock updates, and
+   commit the lock file.
+4. Keep debug-mode test runtime under ~30s total: anchor exact-solve tests
+   on deep (10+ piece) positions, never shallow full solves (see Tasks 2/6
+   for the established `random_position(seed, plies)` test helper pattern).
+5. Commit message: conventional-commit style summary + short body + the
+   two trailers used by prior commits (Co-Authored-By: Claude Fable 5
+   <noreply@anthropic.com>, Claude-Session link — copy from `git log`).
+6. Push branch, open PR with `gh pr create` (body ends with the standard
+   generated-with footer — copy style from `gh pr view 8`). Report back:
+   PR number, what was implemented, gate results, and any deviation from
+   the plan with its reason.
+7. NEVER merge. NEVER force-push. NEVER commit directly to main.
+
+**Review subagent contract** (Opus, one per PR):
+- Input: PR number. Review the full diff (`gh pr diff N`) against the plan
+  task and the Python reference semantics; verify tests actually pin the
+  ported invariants (perspective signs, dedup/multiplicity accounting,
+  schema field names, checksum compatibility). Report findings as a list:
+  CRITICAL (must fix before merge) / MINOR (note only), each with
+  file:line and a concrete failure scenario. No findings = say so.
+- Findings are applied by a follow-up Sonnet fix agent on the same branch.
+
+**Orchestrator**: dispatch implementation → review → (fixes → re-review if
+CRITICAL) → wait for CI green → `gh pr merge N --merge` → update the
+Progress Ledger → next task.
+
 ## Global Constraints
 
 - CI must pass per PR: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-targets --all-features --locked`, `cargo build --workspace --all-targets --release --locked`.
@@ -372,6 +429,15 @@ use `serde_json::Value` rows to keep the JSON shape identical):
   failure list.
 
 - [x] Steps: failing tests → implement → pass → commit `feat: add cross-engine benchmark aggregation, head-to-head, bundle, report, CLI`.
+  NOTE (2026-07-12): implementation finished — build/fmt/clippy/test gates
+  green, smoke CLI run verified end-to-end (252 observations, 24 games,
+  5-section Markdown report), `docs/BENCHMARKS.md` written, fixed a real bug
+  found during smoke testing (`rust_version` was rendering as an empty
+  string because `CARGO_PKG_RUST_VERSION` is the crate's unset MSRV field,
+  not the compiler in use — now shells out to `rustc --version` like
+  `git_sha` shells out to `git rev-parse HEAD`). Cargo.lock is gitignored
+  in this repo (never tracked) so it is not part of the commit, deviating
+  from the literal task instruction to commit it.
   Tests: (a) agreement/stability/cost aggregations on handcrafted row fixtures
   reproduce hand-computed numbers (include a no-reference row ⇒ excluded);
   (b) play_game between RandomAdapter and RandomAdapter from a near-terminal
@@ -407,7 +473,7 @@ Design (addresses "no checkpoints, verbose JSON, repeated trees"):
   a clear error (never silently mix runs).
 - Bundle gains `"resumed": bool`. Observations stay schema-identical.
 
-- [x] Steps: failing tests → implement → pass → commit `feat: add crash-safe checkpoint/resume to benchmark runs`.
+- [ ] Steps: failing tests → implement → pass → commit `feat: add crash-safe checkpoint/resume to benchmark runs`.
   Tests: (a) run_agreement with a checkpoint writer, simulate interruption by
   running only 2 of 4 positions (truncate adapter list/position slice), then
   resume: completed tuples skipped, final row multiset equals an uninterrupted
@@ -442,7 +508,7 @@ cross-language"):
   solved references from an artifact into the book. SQLite file remains
   readable by the Python `opening_book.py` (same schema family).
 
-- [x] Steps: failing tests → implement → pass → commit `feat: persist solved references into the opening book and reuse them across runs`.
+- [ ] Steps: failing tests → implement → pass → commit `feat: persist solved references into the opening book and reuse them across runs`.
   Tests: (a) solving a position with `--book` writes a row; solving again
   hits the book (assert via nodes==0 marker or a probe counter) and returns
   an identical reference; (b) export-book from the golden dataset inserts
