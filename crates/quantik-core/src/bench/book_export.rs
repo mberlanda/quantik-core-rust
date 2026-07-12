@@ -8,26 +8,31 @@
 //! across languages: a book built by `quantik-core-rust` can be read by
 //! `opening_book.py` and vice versa.
 //!
-//! **Orientation caveat:** [`export_references`] writes every solved
-//! dataset position regardless of whether that position is its own
-//! canonical representative — its optimal moves are recorded in the
-//! position's own orientation (as `(shape, position)` pairs), while the
-//! row is keyed by the position's *canonical* key (computed inside
-//! [`crate::opening_book::OpeningBookDatabase::add_solved_position`] via
-//! symmetry reduction). Translating those moves back to an arbitrary
-//! queried orientation would require tracking which symmetry transform
-//! was applied, which the book does not currently store. Rather than risk
-//! serving moves that are illegal in the queried orientation,
-//! [`lookup_reference`] only ever returns a hit when the *query* itself is
-//! already its own canonical representative
-//! (`State::new(*bb).canonical_payload() == bb.to_le_bytes()`) — in that
-//! case the stored moves are trivially in the right orientation whenever
-//! the row was itself written from a canonical-orientation position, which
-//! is the common case because the benchmark dataset deduplicates positions
-//! by canonical key (at most one orientation is ever recorded per
-//! canonical class within a single dataset). Full orientation tracking
-//! (storing the symmetry transform index so moves can be translated to any
-//! queried orientation) is left as a follow-up.
+//! **Orientation caveat — representative-only, on BOTH reads and writes:**
+//! optimal moves are recorded as `(shape, position)` pairs in a specific
+//! board orientation, but the row is keyed by the canonical key, which is
+//! shared by up to eight symmetric orientations. The book does not (yet)
+//! store which symmetry transform maps the stored orientation to an
+//! arbitrary query, so moves cannot be translated across orientations.
+//! Both directions are therefore restricted to boards that are their own
+//! canonical representative
+//! (`State::new(*bb).canonical_payload() == bb.to_le_bytes()`):
+//!
+//! - **Writes** ([`export_references`], and
+//!   [`crate::opening_book::OpeningBookDatabase::add_solved_position`]
+//!   itself as defense in depth) silently skip any solved position that
+//!   is not its own canonical representative. Without this guard, a row
+//!   written from a rotated orientation would later be served — with
+//!   wrong, possibly illegal moves — to a query on the representative
+//!   board, which passes the read-side check below.
+//! - **Reads** ([`lookup_reference`]) only return a hit when the *query*
+//!   is its own canonical representative; together with the write guard
+//!   this means stored moves are always in exactly the orientation of any
+//!   board they are served for.
+//!
+//! Full orientation tracking (storing the symmetry transform index so
+//! moves can be translated to any queried orientation) is the documented
+//! follow-up that would lift this restriction on both sides.
 
 use crate::bitboard::Bitboard;
 use crate::game::current_player;
@@ -37,10 +42,15 @@ use serde_json::{json, Value};
 
 use super::reference::parse_move_key;
 
-/// Upsert every solved reference in `dataset_payload` (a dataset or bundle
-/// JSON artifact with a top-level `positions` array, each entry carrying
-/// `qfen` and an optional `reference`) into `db`. Positions with a `null`
-/// reference are skipped. Returns the number of positions inserted.
+/// Upsert every eligible solved reference in `dataset_payload` (a dataset
+/// or bundle JSON artifact with a top-level `positions` array, each entry
+/// carrying `qfen` and an optional `reference`) into `db`. Positions with
+/// a `null` reference are skipped, and — per the module-level orientation
+/// caveat — so are solved positions that are **not their own canonical
+/// representative** (silently: their optimal moves are in their own
+/// orientation, which is the wrong orientation for the canonical key the
+/// row would be stored under). Returns the number of positions actually
+/// inserted.
 ///
 /// Idempotent: re-running against the same payload upserts the same rows
 /// (`INSERT OR REPLACE` semantics via
@@ -65,6 +75,13 @@ pub fn export_references(dataset_payload: &Value, db: &OpeningBookDatabase) -> R
             .ok_or("dataset position missing qfen")?;
         let state = State::from_qfen(qfen).map_err(|e| format!("parse qfen {qfen:?}: {e}"))?;
 
+        // Write-side orientation guard, symmetric with lookup_reference's
+        // read-side guard: only canonical representatives may be stored.
+        // (add_solved_position enforces this too, as defense in depth.)
+        if state.canonical_payload() != state.bb.to_le_bytes() {
+            continue;
+        }
+
         let value = reference["value"]
             .as_i64()
             .ok_or_else(|| format!("reference for {qfen} missing integer value"))?
@@ -83,9 +100,12 @@ pub fn export_references(dataset_payload: &Value, db: &OpeningBookDatabase) -> R
             })
             .collect::<Result<Vec<(i32, i32)>, String>>()?;
 
-        db.add_solved_position(&state, value, &optimal_moves)
+        let written = db
+            .add_solved_position(&state, value, &optimal_moves)
             .map_err(|e| format!("add_solved_position for {qfen}: {e}"))?;
-        count += 1;
+        if written {
+            count += 1;
+        }
     }
 
     Ok(count)
@@ -275,24 +295,102 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// Smoke test for the `export-book` CLI path: the golden shared
-    /// dataset carries exactly 22 solved references; exporting it inserts
-    /// all 22, and a rerun is idempotent (still 22 rows total in the
-    /// positions table, not 44).
+    /// Smoke test for the `export-book` CLI path against the golden
+    /// shared dataset (22 solved references). Only solved positions that
+    /// are their own canonical representative are eligible for storage
+    /// (the write-side orientation guard), so the expected insertion
+    /// count is computed from the artifact rather than hardcoded, and the
+    /// exported rows must be exactly that set. A rerun is idempotent (no
+    /// row growth).
     #[test]
-    fn golden_dataset_export_inserts_all_solved_references_idempotently() {
+    fn golden_dataset_export_inserts_exactly_the_representative_solved_set() {
         let golden = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../benchmarks/positions-v1.json");
         let payload = crate::bench::dataset::load(&golden).unwrap();
 
+        let positions = payload["positions"].as_array().unwrap();
+        let (representative, skipped): (Vec<&Value>, Vec<&Value>) = positions
+            .iter()
+            .filter(|p| !p["reference"].is_null())
+            .partition(|p| {
+                let state = State::from_qfen(p["qfen"].as_str().unwrap()).unwrap();
+                state.canonical_payload() == state.bb.to_le_bytes()
+            });
+        // The golden artifact must exercise both sides of the guard.
+        assert!(!representative.is_empty(), "no representative solved refs");
+        assert!(!skipped.is_empty(), "no non-representative solved refs");
+
+        let expected = representative.len() as u64;
         let path = temp_db_path("golden");
         let db = open_book(&path);
-        assert_eq!(export_references(&payload, &db).unwrap(), 22);
-        assert_eq!(db.total_positions().unwrap(), 22);
+        assert_eq!(export_references(&payload, &db).unwrap(), expected);
+        assert_eq!(db.total_positions().unwrap() as u64, expected);
 
-        // Rerun: same 22 upserts, no row growth.
-        assert_eq!(export_references(&payload, &db).unwrap(), 22);
-        assert_eq!(db.total_positions().unwrap(), 22);
+        // Exactly the representative set is present; the rest is absent.
+        for p in &representative {
+            let state = State::from_qfen(p["qfen"].as_str().unwrap()).unwrap();
+            let entry = db.get_position(&state).unwrap().unwrap();
+            assert!(entry.solved);
+            assert_eq!(
+                entry.game_value.unwrap() as i64,
+                p["reference"]["value"].as_i64().unwrap()
+            );
+        }
+        for p in &skipped {
+            let state = State::from_qfen(p["qfen"].as_str().unwrap()).unwrap();
+            assert!(
+                db.get_position(&state).unwrap().is_none(),
+                "non-representative {} must not be stored",
+                p["id"]
+            );
+        }
+
+        // Rerun: same upserts, no row growth.
+        assert_eq!(export_references(&payload, &db).unwrap(), expected);
+        assert_eq!(db.total_positions().unwrap() as u64, expected);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Regression test for the cross-orientation wrong-hit bug: storing a
+    /// solved position that is NOT its own canonical representative, then
+    /// querying its canonical representative (which passes the read-side
+    /// guard), must return None — nothing may have been written, because
+    /// the stored moves would be in the wrong orientation for that board.
+    /// Before the write-side guard existed, this lookup returned a hit
+    /// whose optimal_moves were wrong (possibly illegal) for the queried
+    /// board.
+    #[test]
+    fn non_canonical_write_never_pollutes_the_representative_lookup() {
+        let bb = non_canonical_position(0, 11);
+        let reference = solve_position(&bb, 60.0).unwrap();
+        let qfen = State::new(bb).to_qfen();
+        let dataset_payload = json!({
+            "positions": [
+                {"id": "p0000", "qfen": qfen, "phase": "endgame", "reference": reference},
+            ],
+        });
+
+        let path = temp_db_path("cross-orientation");
+        let db = open_book(&path);
+
+        // The write must be skipped entirely.
+        assert_eq!(export_references(&dataset_payload, &db).unwrap(), 0);
+        assert_eq!(db.total_positions().unwrap(), 0);
+
+        // The canonical representative of the same class (idempotent:
+        // it IS its own representative, so it passes the read guard) must
+        // find nothing.
+        let canon_bb = Bitboard::from_le_bytes(&State::new(bb).canonical_payload());
+        assert_eq!(
+            State::new(canon_bb).canonical_payload(),
+            canon_bb.to_le_bytes(),
+            "canonicalization is idempotent"
+        );
+        assert!(lookup_reference(&canon_bb, &db).is_none());
+
+        // And so must the original orientation.
+        assert!(lookup_reference(&bb, &db).is_none());
 
         std::fs::remove_file(&path).ok();
     }

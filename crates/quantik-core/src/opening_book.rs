@@ -188,6 +188,22 @@ impl OpeningBookDatabase {
     /// optimal move (not just a top-5 slice, unlike [`Self::add_position`])
     /// as `(shape, position)` pairs in the given order.
     ///
+    /// **Only canonical representatives are stored.** The optimal moves
+    /// are expressed in `state`'s own board orientation, but the row is
+    /// keyed by the canonical key shared by up to eight symmetric
+    /// orientations; storing a non-representative orientation would let a
+    /// later lookup on the *representative* serve moves that are wrong
+    /// (possibly illegal) for that board. If `state` is not its own
+    /// canonical representative (`canonical_payload() != bb.to_le_bytes()`),
+    /// nothing is written and `Ok(false)` is returned; `Ok(true)` means
+    /// the row was upserted. Translating moves across orientations via
+    /// the symmetry transform is a documented follow-up that would lift
+    /// this restriction.
+    ///
+    /// The position row and its best-move rows are written in one
+    /// transaction, so a mid-way failure can never leave a solved row
+    /// with partial `best_moves`.
+    ///
     /// Visit/win/draw counters and `symmetry_count` are not meaningful for
     /// a solved reference and are stored as `0`.
     pub fn add_solved_position(
@@ -195,13 +211,18 @@ impl OpeningBookDatabase {
         state: &State,
         game_value: i32,
         optimal_moves: &[(i32, i32)],
-    ) -> SqlResult<()> {
+    ) -> SqlResult<bool> {
+        if state.canonical_payload() != state.bb.to_le_bytes() {
+            return Ok(false);
+        }
+
         let canonical_key = state.canonical_key().to_vec();
         let qfen = state.to_qfen();
         let depth = (state.bb.player_piece_count(0) + state.bb.player_piece_count(1)) as i32;
         let evaluation = game_value as f64;
 
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT OR REPLACE INTO positions
              (canonical_key, qfen, depth, evaluation, visit_count,
               win_count_p0, win_count_p1, draw_count, is_terminal, symmetry_count,
@@ -217,19 +238,20 @@ impl OpeningBookDatabase {
             ],
         )?;
 
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM best_moves WHERE canonical_key = ?1",
             params![canonical_key],
         )?;
 
         for (rank, &(shape, position)) in optimal_moves.iter().enumerate() {
-            self.conn.execute(
+            tx.execute(
                 "INSERT INTO best_moves (canonical_key, move_rank, shape, position)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![canonical_key, (rank + 1) as i32, shape, position],
             )?;
         }
-        Ok(())
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn get_position(&self, state: &State) -> SqlResult<Option<OpeningBookEntry>> {
@@ -506,9 +528,12 @@ mod tests {
         };
         let db = OpeningBookDatabase::open(&config).unwrap();
 
+        // The empty board is trivially its own canonical representative.
         let state = State::empty();
-        db.add_solved_position(&state, 1, &[(0, 0), (1, 5)])
+        let written = db
+            .add_solved_position(&state, 1, &[(0, 0), (1, 5)])
             .unwrap();
+        assert!(written);
 
         let entry = db.get_position(&state).unwrap().unwrap();
         assert!(entry.solved);
@@ -517,6 +542,39 @@ mod tests {
         assert_eq!(entry.is_terminal, TerminalStatus::Interior);
         assert_eq!(entry.depth, 0);
         assert_eq!(entry.best_moves, vec![(0, 0), (1, 5)]);
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// Defense-in-depth guard: `add_solved_position` refuses (returns
+    /// `Ok(false)`, writes nothing) when the state is not its own
+    /// canonical representative — its moves would be stored in the wrong
+    /// orientation for the canonical key.
+    #[test]
+    fn add_solved_position_skips_non_canonical_orientations() {
+        let path = temp_db_path();
+        let config = OpeningBookConfig {
+            database_path: path.clone(),
+            ..Default::default()
+        };
+        let db = OpeningBookDatabase::open(&config).unwrap();
+
+        // Find a single-piece placement that is NOT its own canonical
+        // representative (most of the 16 cells aren't).
+        let state = (0..16)
+            .map(|pos| {
+                let mut qfen: Vec<char> = "..../..../..../....".chars().collect();
+                let index = pos + pos / 4; // account for '/' separators
+                qfen[index] = 'A';
+                State::from_qfen(&qfen.into_iter().collect::<String>()).unwrap()
+            })
+            .find(|s| s.canonical_payload() != s.bb.to_le_bytes())
+            .expect("some single-piece placement is non-canonical");
+
+        let written = db.add_solved_position(&state, 1, &[(0, 0)]).unwrap();
+        assert!(!written);
+        assert_eq!(db.total_positions().unwrap(), 0);
+        assert!(db.get_position(&state).unwrap().is_none());
 
         fs::remove_file(&path).ok();
     }

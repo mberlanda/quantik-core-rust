@@ -128,9 +128,10 @@ pub fn solve_position(bb: &Bitboard, budget_s: f64) -> Option<Value> {
 /// through `book` (best-effort — a write failure is silently ignored, the
 /// solve itself already succeeded and is returned regardless).
 ///
-/// See [`crate::bench::book_export`] for the book-lookup orientation
-/// caveat: a hit is only possible when `bb` is its own canonical
-/// representative.
+/// See [`crate::bench::book_export`] for the orientation caveat: both the
+/// lookup and the write-back apply only when `bb` is its own canonical
+/// representative — the stored moves are in that one orientation and
+/// cannot be translated across symmetries yet.
 pub fn solve_position_with_book(
     bb: &Bitboard,
     budget_s: f64,
@@ -144,19 +145,24 @@ pub fn solve_position_with_book(
 
     let reference = solve_position(bb, budget_s)?;
 
+    // Write-side orientation guard, symmetric with lookup_reference's
+    // read-side guard: only canonical representatives may be stored
+    // (add_solved_position enforces this too, as defense in depth).
     if let Some(db) = book {
-        let value = reference["value"].as_i64().unwrap_or(0) as i32;
-        if let Some(optimal_moves) = reference["optimal_moves"].as_array() {
-            let parsed: Result<Vec<(i32, i32)>, String> = optimal_moves
-                .iter()
-                .map(|v| {
-                    let key = v.as_str().ok_or("optimal_moves entry is not a string")?;
-                    let (_, shape, pos) = parse_move_key(key)?;
-                    Ok((shape as i32, pos as i32))
-                })
-                .collect();
-            if let Ok(optimal_moves) = parsed {
-                let _ = db.add_solved_position(&State::new(*bb), value, &optimal_moves);
+        if State::new(*bb).canonical_payload() == bb.to_le_bytes() {
+            let value = reference["value"].as_i64().unwrap_or(0) as i32;
+            if let Some(optimal_moves) = reference["optimal_moves"].as_array() {
+                let parsed: Result<Vec<(i32, i32)>, String> = optimal_moves
+                    .iter()
+                    .map(|v| {
+                        let key = v.as_str().ok_or("optimal_moves entry is not a string")?;
+                        let (_, shape, pos) = parse_move_key(key)?;
+                        Ok((shape as i32, pos as i32))
+                    })
+                    .collect();
+                if let Ok(optimal_moves) = parsed {
+                    let _ = db.add_solved_position(&State::new(*bb), value, &optimal_moves);
+                }
             }
         }
     }

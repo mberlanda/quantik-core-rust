@@ -528,8 +528,13 @@ cross-language"):
   (export_references + representative-only lookup_reference),
   `solve_position_with_book`/`augment_with_references_with_book` (old fns
   delegate with None), `dataset --book` + `export-book` CLI, BENCHMARKS.md
-  section. Gates green (120 tests, ~2s debug). CLI smoke: golden dataset
-  export inserted 22 references, rerun idempotent (22 rows).
+  section. Review fix: the representative-only restriction now guards
+  WRITES too (export, write-back, and add_solved_position itself) — a
+  non-representative row under the canonical key would serve wrong-
+  orientation moves to a lookup on the representative board. Golden
+  export therefore inserts the representative solved subset (1 of 22),
+  rerun idempotent; regression test pinned (fails on pre-fix commit).
+  Gates green (122 tests, ~7s debug).
   Tests: (a) solving a position with `--book` writes a row; solving again
   hits the book (assert via nodes==0 marker or a probe counter) and returns
   an identical reference; (b) export-book from the golden dataset inserts

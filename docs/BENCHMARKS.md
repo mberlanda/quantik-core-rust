@@ -163,17 +163,30 @@ canonical orientation. Pre-existing book databases are upgraded in place:
 opening one adds the `solved`/`game_value` columns idempotently, and old
 rows read back as `solved = false`.
 
-**Representative-only lookup caveat:** the stored optimal moves are in
-the orientation of the position that was solved, but the row is keyed by
-the canonical key, which is shared by up to eight symmetric orientations.
-The book does not (yet) record which symmetry transform maps the stored
-orientation to an arbitrary query, so a lookup only returns a hit when
-the queried board **is its own canonical representative** — otherwise the
-solver falls through to a fresh minimax solve (and writes the result
-back). Move translation across orientations is a documented follow-up;
-until then, book hits accelerate the canonical-representative subset of
-queries and never risk serving moves that are illegal in the queried
-orientation.
+**Representative-only caveat (applies to both reads and writes):** the
+stored optimal moves are `(shape, position)` pairs in one specific board
+orientation, but the row is keyed by the canonical key, which is shared
+by up to eight symmetric orientations. The book does not (yet) record
+which symmetry transform maps the stored orientation to an arbitrary
+query, so moves cannot be translated across orientations. Both
+directions are therefore restricted to boards that are their own
+canonical representative:
+
+- *Writes* skip any solved position that is not its own canonical
+  representative — storing one would let a later lookup on the
+  representative board pass the read check and be served moves that are
+  wrong (possibly illegal) for it. `export-book` counts and inserts only
+  the representative subset (a solved reference that is skipped is simply
+  re-solvable later).
+- *Reads* only return a hit when the queried board is its own canonical
+  representative — any other orientation falls through to a fresh
+  minimax solve (which then writes back if, and only if, the board is a
+  representative).
+
+Move translation via the stored symmetry transform is the documented
+follow-up that would lift the restriction on both sides; until then,
+book hits accelerate the canonical-representative subset of queries and
+never risk serving moves that are illegal in the queried orientation.
 
 **Cross-language portability:** the canonical key is byte-identical to
 the Python implementation's (`VERSION=1`, `FLAG_CANON=2`, little-endian
@@ -191,8 +204,9 @@ cargo run --release --bin cross_engine_benchmark -- dataset \
   --book benchmarks/results/book.db \
   --output benchmarks/positions-v1.json
 
-# Bulk-export all solved references from an existing (checksum-verified)
-# dataset artifact into a book. Idempotent: reruns upsert the same rows.
+# Bulk-export the canonical-representative solved references from an
+# existing (checksum-verified) dataset artifact into a book. Idempotent:
+# reruns upsert the same rows.
 cargo run --release --bin cross_engine_benchmark -- export-book \
   --input benchmarks/positions-v1.json \
   --db benchmarks/results/book.db
