@@ -4,8 +4,10 @@
 //! The checkpoint file is JSON Lines: a header line identifying which
 //! dataset and run configuration it belongs to, followed by one line per
 //! completed observation row or head-to-head record. Every line is flushed
-//! individually, so a crash loses at most the line in flight — everything
-//! written before it is intact and reloadable.
+//! to the OS individually (crash-safe against process death — Ctrl-C,
+//! panic, kill; not fsync'd against power loss), so a crash loses at most
+//! the line in flight, and the loader tolerates a truncated tail —
+//! everything written before it is intact and reloadable.
 //!
 //! ```text
 //! {"kind":"header","dataset_checksum":"...","config_fingerprint":"..."}
@@ -57,10 +59,17 @@ pub struct CheckpointState {
 /// and the byte length of the file up to and including the last line that
 /// parsed successfully. A truncated final line (partial write from a
 /// crash) is excluded from both `entries` and `valid_len`.
+///
+/// `ends_with_newline` is false when the kept region's final line parsed
+/// as valid JSON but its trailing `\n` was lost (a crash can persist the
+/// bytes of a line without its newline); appending directly after such a
+/// line would merge two records into one corrupt line, so
+/// [`CheckpointWriter::resume`] must restore the newline first.
 struct ParsedCheckpoint {
     header: Value,
     entries: Vec<Value>,
     valid_len: u64,
+    ends_with_newline: bool,
 }
 
 fn parse_checkpoint_file(path: &Path) -> Result<ParsedCheckpoint, String> {
@@ -97,10 +106,12 @@ fn parse_checkpoint_file(path: &Path) -> Result<ParsedCheckpoint, String> {
     }
 
     let header = header.ok_or("checkpoint file is empty or missing its header line")?;
+    let ends_with_newline = valid_len == 0 || text.as_bytes()[valid_len as usize - 1] == b'\n';
     Ok(ParsedCheckpoint {
         header,
         entries,
         valid_len,
+        ends_with_newline,
     })
 }
 
@@ -151,8 +162,10 @@ pub fn load_checkpoint(
     Ok(state)
 }
 
-/// Appends JSON Lines to a checkpoint file, flushing after every line so a
-/// crash loses at most the line currently being written.
+/// Appends JSON Lines to a checkpoint file, flushing to the OS after every
+/// line so a process crash loses at most the line currently being written
+/// (not fsync'd, so power loss can lose more — the loader tolerates a
+/// truncated tail either way).
 #[derive(Debug)]
 pub struct CheckpointWriter {
     file: BufWriter<File>,
@@ -193,7 +206,9 @@ impl CheckpointWriter {
 
     /// Reopen an already-validated checkpoint (see [`load_checkpoint`]) for
     /// appending. Any truncated trailing line left by a prior crash is
-    /// dropped first, so the file only ever holds complete lines before new
+    /// dropped first, and if the last kept line is valid JSON that lost
+    /// only its trailing newline, the newline is restored — so the file
+    /// only ever holds complete, newline-terminated lines before new
     /// writes resume.
     pub fn resume(path: &Path) -> Result<Self, String> {
         let parsed = parse_checkpoint_file(path)?;
@@ -210,9 +225,20 @@ impl CheckpointWriter {
             .append(true)
             .open(path)
             .map_err(|e| format!("open {path:?}: {e}"))?;
-        Ok(CheckpointWriter {
+        let mut writer = CheckpointWriter {
             file: BufWriter::new(file),
-        })
+        };
+        if !parsed.ends_with_newline {
+            // A crash can persist a complete final line but drop its
+            // newline; appending straight after it would merge two records
+            // into one corrupt line and break the *next* resume.
+            writer
+                .file
+                .write_all(b"\n")
+                .and_then(|()| writer.file.flush())
+                .map_err(|e| format!("repair {path:?}: {e}"))?;
+        }
+        Ok(writer)
     }
 
     fn write_line(&mut self, value: &Value) -> Result<(), String> {
@@ -455,6 +481,56 @@ mod tests {
 
         let state = load_checkpoint(&path, "c", "f").unwrap();
         assert_eq!(state.rows.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resume_repairs_valid_final_line_missing_only_its_newline() {
+        let dir = scratch_dir("newline-lost");
+        let path = dir.join("run.ckpt");
+        {
+            let mut writer = CheckpointWriter::create(&path, "c", "f").unwrap();
+            writer
+                .write_row(&json!({
+                    "engine": "random", "config_label": "random",
+                    "position_id": "p0", "seed": 0, "move": "0:0:0",
+                }))
+                .unwrap();
+        }
+        // Simulate a crash that persisted the full final line but dropped
+        // only its trailing newline: chop exactly one byte off the file.
+        {
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let len = file.metadata().unwrap().len();
+            assert_eq!(
+                std::fs::read(&path).unwrap().last(),
+                Some(&b'\n'),
+                "precondition: file ends with a newline"
+            );
+            file.set_len(len - 1).unwrap();
+        }
+
+        // The newline-less final line is still valid JSON and must be kept.
+        let state = load_checkpoint(&path, "c", "f").unwrap();
+        assert_eq!(state.rows.len(), 1);
+
+        // Resume must restore the newline before appending, or the next
+        // record would merge into the previous line and corrupt the file.
+        {
+            let mut writer = CheckpointWriter::resume(&path).unwrap();
+            writer
+                .write_row(&json!({
+                    "engine": "random", "config_label": "random",
+                    "position_id": "p1", "seed": 0, "move": "0:0:1",
+                }))
+                .unwrap();
+        }
+
+        let state = load_checkpoint(&path, "c", "f").unwrap();
+        assert_eq!(state.rows.len(), 2, "both records survive the repair");
+        assert_eq!(state.rows[0]["position_id"], json!("p0"));
+        assert_eq!(state.rows[1]["position_id"], json!("p1"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

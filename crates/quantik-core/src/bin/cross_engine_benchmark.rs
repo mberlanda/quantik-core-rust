@@ -180,17 +180,6 @@ fn cmd_run(
     resume: bool,
 ) -> Result<(), String> {
     let payload = dataset::load(dataset_path)?;
-    let adapters = build_adapters(&args);
-    let positions = payload["positions"].as_array().cloned().unwrap_or_default();
-
-    let failures = run_preflight(&adapters, &positions);
-    if !failures.is_empty() {
-        eprintln!("PREFLIGHT FAILED - benchmark aborted:");
-        for failure in &failures {
-            eprintln!("  - {failure}");
-        }
-        return Err("preflight failed".into());
-    }
 
     let seeds: Vec<u64> = (0..seeds_count).map(|i| seed_base + i).collect();
 
@@ -220,13 +209,20 @@ fn cmd_run(
     let dataset_checksum = payload["checksum"].as_str().unwrap_or_default().to_string();
     let config_fingerprint = checkpoint::config_fingerprint(&config);
 
-    let mut checkpoint_writer: Option<CheckpointWriter> = None;
+    // Checkpoint validation runs BEFORE preflight so user errors (an
+    // existing checkpoint without --resume, a header mismatch, a missing
+    // file with --resume) are refused immediately, not after expensive
+    // engine work. The writer itself is only opened after preflight passes,
+    // so an aborted preflight never leaves a header-only checkpoint behind.
     let mut loaded_rows: Vec<Value> = Vec::new();
     let mut loaded_records: Vec<Value> = Vec::new();
     let mut row_skip: HashSet<RunKey> = HashSet::new();
     let mut record_skip: HashSet<GameKey> = HashSet::new();
     let mut resumed = false;
 
+    if resume && checkpoint_path.is_none() {
+        eprintln!("warning: --resume has no effect without --checkpoint <path>; running fresh");
+    }
     if let Some(path) = checkpoint_path {
         if resume {
             if !path.exists() {
@@ -242,15 +238,36 @@ fn cmd_run(
             row_skip = state.row_skip;
             record_skip = state.record_skip;
             resumed = true;
-            checkpoint_writer = Some(CheckpointWriter::resume(path)?);
-        } else {
-            checkpoint_writer = Some(CheckpointWriter::create(
-                path,
-                &dataset_checksum,
-                &config_fingerprint,
-            )?);
+        } else if path.exists() {
+            return Err(format!(
+                "checkpoint file already exists at {}; pass --resume to continue it, or delete \
+                 it to start a fresh run",
+                path.display()
+            ));
         }
     }
+
+    let adapters = build_adapters(&args);
+    let positions = payload["positions"].as_array().cloned().unwrap_or_default();
+
+    let failures = run_preflight(&adapters, &positions);
+    if !failures.is_empty() {
+        eprintln!("PREFLIGHT FAILED - benchmark aborted:");
+        for failure in &failures {
+            eprintln!("  - {failure}");
+        }
+        return Err("preflight failed".into());
+    }
+
+    let mut checkpoint_writer: Option<CheckpointWriter> = match (checkpoint_path, resume) {
+        (Some(path), true) => Some(CheckpointWriter::resume(path)?),
+        (Some(path), false) => Some(CheckpointWriter::create(
+            path,
+            &dataset_checksum,
+            &config_fingerprint,
+        )?),
+        (None, _) => None,
+    };
 
     let fresh_rows =
         run_agreement(

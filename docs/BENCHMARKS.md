@@ -121,12 +121,17 @@ cargo run --release --bin cross_engine_benchmark -- run \
 
 **Crash-safety guarantee:** the checkpoint file is a header line followed
 by one line per completed row/game (`{"kind":"observation","row":{...}}` or
-`{"kind":"h2h","record":{...}}`), each flushed to disk individually. A
-crash can lose at most the single line that was in flight — every line
-written before it is intact, and a truncated trailing line is detected and
-dropped on the next load rather than corrupting the read. Resuming
-re-truncates any such dangling line before appending further, so the file
-never accumulates garbage in its middle.
+`{"kind":"h2h","record":{...}}`), each flushed to the OS after every line.
+This is crash-safe against process death (Ctrl-C, panic, kill, OOM): at
+most the single line in flight is lost, every line written before it is
+intact, and the loader tolerates a truncated tail — a partial trailing
+line is detected and dropped on the next load rather than corrupting the
+read. It is not fsync'd, so a power loss or kernel crash can lose more
+than one line; the loader's truncated-tail tolerance still applies to
+whatever the filesystem persisted. Resuming re-truncates any dangling
+partial line (and restores a newline the crash may have clipped off an
+otherwise-complete final line) before appending further, so the file never
+accumulates garbage in its middle.
 
 **Header validation:** the header records `dataset_checksum` (the loaded
 dataset's checksum) and `config_fingerprint` (a sha256 of the run's
