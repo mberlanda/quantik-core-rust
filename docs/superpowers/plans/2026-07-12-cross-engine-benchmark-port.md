@@ -51,6 +51,7 @@ serde/serde_json) plus `sha2` (checksums) and `chrono` (timestamps).
 | 8 checkpoint/resume | #10 | MERGED |
 | 9 opening-book persistence | #11 | MERGED |
 | 10 changelog/docs + full benchmark run | #12 | MERGED; full fixed-1s-seeds30 run completed 2026-07-12, report on PR #12 |
+| 11 Python-compatible checkpoint dirs + workers + partial reports | #14 | MERGED; Opus review APPROVE-WITH-MINOR, M1 (chunked parallel checkpoint streaming) fixed pre-merge; cross-language rehydration verified Rust↔Python empirically |
 
 ## Delegation Protocol (subagent-driven from Task 7 onward)
 
