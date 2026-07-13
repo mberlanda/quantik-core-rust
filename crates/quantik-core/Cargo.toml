@@ -2,7 +2,15 @@
 name = "quantik-core"
 version = "0.1.0"
 edition = "2021"
-description = "High-performance Quantik board game engine"
+description = "High-performance Quantik board game engine: bitboard state, QFEN notation, canonical symmetry-reduced keys, and minimax/MCTS/beam-search engines. Rust companion to the Python quantik-core package."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/mberlanda/quantik-core-rust"
+homepage = "https://github.com/mberlanda/quantik-core-rust"
+documentation = "https://docs.rs/quantik-core"
+keywords = ["quantik", "board-games", "mcts", "bitboards", "game-ai"]
+categories = ["game-development", "algorithms"]
+authors = ["Mauro Berlanda <mauro.berlanda@gmail.com>"]
 
 [dependencies]
 chrono = "0.4"
