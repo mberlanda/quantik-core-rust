@@ -6,6 +6,24 @@ All notable changes to `quantik-core` are documented here.
 
 ### Added
 
+- Added crates.io publication metadata to `crates/quantik-core/Cargo.toml`
+  (license, keywords, categories, repository/homepage/documentation URLs),
+  a repo-root `LICENSE` (MIT, mirroring the Python package's), a crate-local
+  `README.md` for the crates.io/docs.rs package page, and a
+  trusted-publishing GitHub Actions job (`publish-crate`, triggered on a
+  published GitHub Release, using `rust-lang/crates-io-auth-action` — no
+  static token) so `quantik-core` can be published to crates.io the same
+  way the Python package publishes to PyPI.
+- Updated the root `README.md` to describe this crate as the companion to
+  [`quantik-core` on PyPI](https://pypi.org/project/quantik-core/), with
+  guidance on when to reach for the Rust crate (bulk self-play/training-data
+  generation, exhaustive search, opening-book construction — backed by this
+  week's measured 200-900x wall-clock advantage) versus the Python package
+  (model training, exploratory/notebook work), plus a clarifying note on
+  the "Known Position Counts" table distinguishing ongoing vs. terminal
+  canonical positions.
+- Added `docs/superpowers/plans/2026-07-13-crates-io-packaging-and-ml-data-pipeline.md`,
+  the implementation plan this change executes the first part of.
 - Added `evaluation` module: a fitted-linear feature vector (`features()`) and
   weighted evaluator (`evaluate()`) ported from the Python engine, covering
   own/opponent/shared 3-line threats, mobility difference, and build-two /

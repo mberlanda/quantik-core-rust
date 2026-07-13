@@ -4,9 +4,65 @@ A high-performance Rust engine for the Quantik board game, designed for fast
 move generation, win detection, Monte Carlo search, symmetry-aware storage, and
 opening-book construction.
 
-This crate is the Rust counterpart to the Python Quantik core documentation. It
-keeps the same core model: a tiny bitboard state, QFEN for human-readable
-positions, and canonical binary keys for search caches and databases.
+This crate is the Rust companion to
+[`quantik-core` on PyPI](https://pypi.org/project/quantik-core/) — the same
+project's Python implementation. Both keep the same core model (a tiny
+bitboard state, QFEN for human-readable positions, and canonical binary keys
+for search caches and databases) and produce byte-identical canonical keys
+for the same position, so a database, dataset, or opening book built by one
+implementation is directly readable by the other. They mirror the same
+concepts and naming, not necessarily every function signature verbatim —
+each follows its own language's idioms (Rust structs/methods vs. Python
+classes, `snake_case` vs. Rust's own conventions), so treat them as sharing
+one design, not one literal API surface.
+
+### Which one should I use?
+
+Pick based on what you're doing, not out of habit — and don't hesitate to
+switch mid-project when the activity changes; the shared canonical-key
+format makes that a non-event, not a migration.
+
+**Reach for this Rust crate when the work is compute-bound:**
+- **Bulk self-play or training-data generation.** Benchmarked on identical
+  configurations this repo maintains against the Python implementation:
+  Rust's MCTS/beam search complete the same amount of search work
+  200-900x faster in wall-clock time (see
+  [`docs/benchmarks/rust-vs-python-insights-2026-07-12.md`](docs/benchmarks/rust-vs-python-insights-2026-07-12.md)).
+  If you're generating thousands of self-play games or exhaustively
+  surveying a slice of the game tree, do it here.
+- **Opening-book / exhaustive search construction.** `bench_bfs` and the
+  `examples/depth4_survey.rs`/`examples/depth_sweep.rs` census tools exist
+  because canonicalizing and solving millions of positions is only
+  practical at Rust's node throughput — see
+  [`docs/benchmarks/quantik-game-tree-census-2026-07-13.md`](docs/benchmarks/quantik-game-tree-census-2026-07-13.md)
+  for what that throughput actually made tractable (an exact depth-1-8
+  canonical census, cross-validated against an independent computation).
+
+**Reach for the Python package when the work is exploratory or ML-facing:**
+- **Training a model.** PyTorch, NumPy, and Jupyter/Colab live in Python's
+  ecosystem, not Rust's — the plan is to generate self-play/search data at
+  Rust speed (see
+  [`docs/superpowers/plans/2026-07-13-crates-io-packaging-and-ml-data-pipeline.md`](docs/superpowers/plans/2026-07-13-crates-io-packaging-and-ml-data-pipeline.md)
+  for the exact JSONL schema and export tool this will produce), then load,
+  tensor-encode, and train against that export in Python, e.g.:
+  ```python
+  from quantik_core import State
+  import numpy as np, json
+
+  rows = [json.loads(l) for l in open("selfplay.jsonl")]
+  state = State.from_qfen(rows[0]["qfen"])
+  # ... encode to an 8-channel tensor, feed a policy/value network
+  ```
+- **Quick, interactive exploration of an idea.** A new heuristic, a
+  one-off position analysis, a notebook plot — the Python package's
+  higher-level ergonomics and REPL/notebook workflow beat a compile cycle
+  when you're thinking out loud rather than running at scale.
+  ```python
+  from quantik_core import State
+
+  s = State.from_qfen("A.bC/..../d..B/...a")
+  print(s.canonical_key().hex())  # same 18-byte key this Rust crate computes
+  ```
 
 ## Agent Context
 
@@ -352,6 +408,13 @@ The SQLite database uses two tables:
 
 These counts are for the current Rust canonicalization scope, which preserves
 player color and uses the 192-element D4 x shape-permutation symmetry group.
+Each depth's count includes both ongoing and newly-terminal (winning)
+canonical positions reached at that depth — e.g. depth 4's 10,958 is
+10,946 ongoing positions plus 12 canonical winning positions first reached
+at ply 4. See
+[`docs/benchmarks/quantik-game-tree-census-2026-07-13.md`](docs/benchmarks/quantik-game-tree-census-2026-07-13.md)
+for the ongoing-only breakdown (cross-validated against an independent
+Python computation) and further depths.
 
 | Depth               | Canonical Positions |
 | ------------------- | ------------------- |
