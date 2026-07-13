@@ -320,13 +320,22 @@ references. See [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the full
 methodology.
 
 ```sh
-cargo run --release --bin cross_engine_benchmark -- run \
-  --dataset benchmarks/positions-v1.json --time-limit 1.0 --seeds 30 \
-  --checkpoint benchmarks/results/run.ckpt \
-  --output benchmarks/results/run.json
-cargo run --release --bin cross_engine_benchmark -- report \
-  --input benchmarks/results/run.json
+scripts/generate_positions.sh \
+  --output benchmarks/positions-v1.json
+scripts/generate_observations.sh \
+  --dataset benchmarks/positions-v1.json \
+  --output benchmarks/results/run.json \
+  --checkpoint-dir benchmarks/results/run-ckpt \
+  --engines minimax,mcts,beam \
+  --seeds 30
+scripts/generate_h2h_stats.sh report \
+  --input benchmarks/results/run-ckpt \
+  --report-output benchmarks/results/run.md
 ```
+
+See [`scripts/README.md`](scripts/README.md) for position generation,
+opening-book export/search, selected-engine observations, h2h game planning,
+and parameter-matrix helpers.
 
 ## IDDFS Opening Book Builder
 

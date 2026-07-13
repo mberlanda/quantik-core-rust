@@ -1,0 +1,121 @@
+# Quantik Rust Generation Scripts
+
+These scripts are a small, stable tool layer over the Rust
+`cross_engine_benchmark`, `bench_bfs`, and opening-book binaries.
+
+Run every command from the repository root.
+
+## Positions
+
+Generate valid, reachable, non-terminal positions:
+
+```sh
+scripts/generate_positions.sh \
+  --opening 250 --early-mid 250 --late-mid 250 --endgame 250 \
+  --output benchmarks/positions-1000.json
+```
+
+The underlying Rust dataset generator deduplicates positions by canonical key
+and rejects terminal/dead-end positions.
+
+## Opening Book
+
+Export exact solved references from a positions dataset:
+
+```sh
+scripts/generate_opening_book.sh export \
+  --input benchmarks/positions-1000.json \
+  --db benchmarks/results/opening-book.sqlite
+```
+
+Or build/search an opening book directly with the IDDFS builder:
+
+```sh
+scripts/generate_opening_book.sh search \
+  --depth 6 \
+  --db benchmarks/results/depth6-book.sqlite
+```
+
+## Observations
+
+Generate observations for selected engines with checkpointing:
+
+```sh
+scripts/generate_observations.sh \
+  --dataset benchmarks/positions-1000.json \
+  --output benchmarks/results/mcts-minimax-observations.json \
+  --checkpoint-dir benchmarks/results/mcts-minimax-observations-ckpt \
+  --engines mcts,minimax \
+  --mcts-iterations 5000 \
+  --minimax-depth 8 \
+  --seeds 30 \
+  --workers 4
+```
+
+By default this script passes `--skip-h2h`, so it records observation rows
+without playing head-to-head games. Add `--include-h2h` when you want one run
+to produce both observations and games.
+
+## H2H Stats
+
+Plan the parameters for 1000 games between MCTS and minimax:
+
+```sh
+scripts/plan_runs.sh h2h-games \
+  --games 1000 \
+  --engines mcts,minmax \
+  --positions 50
+```
+
+This prints:
+
+```text
+engines=mcts,minimax
+engine_pairs=1
+h2h_positions=50
+h2h_seeds=10
+planned_games=1000
+cargo_args=--engines mcts,minimax --h2h-positions 50 --h2h-seeds 10
+```
+
+Generate observations, h2h games, and a Markdown report:
+
+```sh
+scripts/generate_h2h_stats.sh run \
+  --dataset benchmarks/positions-1000.json \
+  --output benchmarks/results/mcts-vs-minimax.json \
+  --checkpoint-dir benchmarks/results/mcts-vs-minimax-ckpt \
+  --report-output benchmarks/results/mcts-vs-minimax.md \
+  --engines mcts,minmax \
+  --h2h-positions 50 \
+  --h2h-seeds 10 \
+  --mcts-iterations 5000 \
+  --minimax-depth 8 \
+  --workers 4
+```
+
+Render stats from an existing bundle or checkpoint directory:
+
+```sh
+scripts/generate_h2h_stats.sh report \
+  --input benchmarks/results/mcts-vs-minimax-ckpt \
+  --report-output benchmarks/results/mcts-vs-minimax.md
+```
+
+## Parameter Matrices
+
+Expand combinations into runnable commands:
+
+```sh
+scripts/plan_runs.sh matrix \
+  --engines 'mcts,minimax;mcts,beam;minimax,beam' \
+  --games 1000 \
+  --positions 50 \
+  --mcts-iterations 1500,5000 \
+  --minimax-depth 6,8 \
+  --beam-width 64,128
+```
+
+Use `--dry-run` on the generation scripts when wiring this into a TUI or job
+runner.
+

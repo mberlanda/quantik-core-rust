@@ -6,7 +6,7 @@
 
 use clap::{Parser, Subcommand};
 use quantik_core::bench::adapters::{
-    fixed_time_adapters, BeamAdapter, EngineAdapter, MCTSAdapter, MinimaxAdapter, RandomAdapter,
+    BeamAdapter, EngineAdapter, MCTSAdapter, MinimaxAdapter, RandomAdapter,
 };
 use quantik_core::bench::agreement::{
     aggregate_agreement, aggregate_cost, observation_key, run_agreement, ObservationKey,
@@ -91,6 +91,14 @@ enum Commands {
         beam_width: usize,
         #[arg(long = "beam-depth", default_value_t = 16)]
         beam_depth: u32,
+        /// Comma-separated engines to include, in order. Supported:
+        /// minimax (alias: minmax), mcts, beam, random.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "minimax,mcts,beam,random"
+        )]
+        engines: Vec<String>,
         #[arg(long = "h2h-positions", default_value_t = 8)]
         h2h_positions: usize,
         #[arg(long = "h2h-seeds", default_value_t = 1)]
@@ -159,32 +167,79 @@ struct RunArgs {
     mcts_exploration: f64,
     beam_width: usize,
     beam_depth: u32,
+    engines: Vec<String>,
 }
 
-fn build_adapters(args: &RunArgs) -> Vec<Box<dyn EngineAdapter>> {
-    let mut adapters: Vec<Box<dyn EngineAdapter>> = if args.family == "fixed" {
-        fixed_time_adapters(args.time_limit, args.beam_width)
+fn normalize_engine_name(name: &str) -> Option<&'static str> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "minimax" | "minmax" => Some("minimax"),
+        "mcts" => Some("mcts"),
+        "beam" | "beam_search" | "beam-search" => Some("beam"),
+        "random" | "baseline" => Some("random"),
+        _ => None,
+    }
+}
+
+fn build_adapter(name: &str, args: &RunArgs) -> Box<dyn EngineAdapter> {
+    match name {
+        "minimax" if args.family == "fixed" => Box::new(MinimaxAdapter {
+            max_depth: 16,
+            time_limit_s: Some(args.time_limit),
+        }),
+        "mcts" if args.family == "fixed" => Box::new(MCTSAdapter {
+            max_iterations: 10_000_000,
+            max_depth: 16,
+            exploration_weight: std::f64::consts::SQRT_2,
+            time_limit_s: Some(args.time_limit),
+        }),
+        "beam" if args.family == "fixed" => Box::new(BeamAdapter {
+            beam_width: args.beam_width,
+            max_depth: 16,
+            time_limit_s: Some(args.time_limit),
+        }),
+        "minimax" => Box::new(MinimaxAdapter {
+            max_depth: args.minimax_depth,
+            time_limit_s: Some(args.minimax_time),
+        }),
+        "mcts" => Box::new(MCTSAdapter {
+            max_iterations: args.mcts_iterations,
+            max_depth: args.mcts_depth,
+            exploration_weight: args.mcts_exploration,
+            time_limit_s: None,
+        }),
+        "beam" => Box::new(BeamAdapter {
+            beam_width: args.beam_width,
+            max_depth: args.beam_depth,
+            time_limit_s: None,
+        }),
+        "random" => Box::new(RandomAdapter),
+        _ => unreachable!("validated engine name"),
+    }
+}
+
+fn build_adapters(args: &RunArgs) -> Result<Vec<Box<dyn EngineAdapter>>, String> {
+    let requested = if args.engines.is_empty() {
+        vec!["minimax", "mcts", "beam", "random"]
     } else {
-        vec![
-            Box::new(MinimaxAdapter {
-                max_depth: args.minimax_depth,
-                time_limit_s: Some(args.minimax_time),
-            }),
-            Box::new(MCTSAdapter {
-                max_iterations: args.mcts_iterations,
-                max_depth: args.mcts_depth,
-                exploration_weight: args.mcts_exploration,
-                time_limit_s: None,
-            }),
-            Box::new(BeamAdapter {
-                beam_width: args.beam_width,
-                max_depth: args.beam_depth,
-                time_limit_s: None,
-            }),
-        ]
+        let mut normalized = Vec::new();
+        for engine in &args.engines {
+            let Some(name) = normalize_engine_name(engine) else {
+                return Err(format!(
+                    "unknown engine {engine:?}; supported engines: minimax, mcts, beam, random"
+                ));
+            };
+            if normalized.contains(&name) {
+                return Err(format!("duplicate engine {name:?}"));
+            }
+            normalized.push(name);
+        }
+        normalized
     };
-    adapters.push(Box::new(RandomAdapter));
-    adapters
+
+    Ok(requested
+        .into_iter()
+        .map(|name| build_adapter(name, args))
+        .collect())
 }
 
 /// Pick positions round-robin across phase buckets.
@@ -263,7 +318,11 @@ fn cmd_run(
 
     let payload = dataset::load(dataset_path)?;
     let seeds: Vec<u64> = (0..seeds_count).map(|i| seed_base + i).collect();
-    let adapters = build_adapters(&args);
+    let adapters = build_adapters(&args)?;
+    if !skip_h2h && adapters.len() < 2 {
+        return Err("head-to-head requires at least two selected engines".into());
+    }
+    let engine_names: Vec<&str> = adapters.iter().map(|adapter| adapter.name()).collect();
     let positions = payload["positions"].as_array().cloned().unwrap_or_default();
     let sampled_h2h_positions = h2h_positions(&payload, h2h_position_count);
     let h2h_seeds: Vec<u64> = (0..h2h_seed_count).map(|i| seed_base + i).collect();
@@ -286,6 +345,7 @@ fn cmd_run(
         "mcts_exploration": args.mcts_exploration,
         "beam_width": args.beam_width,
         "beam_depth": args.beam_depth,
+        "engines": engine_names,
         "h2h_positions": h2h_position_count,
         "h2h_seeds": h2h_seed_count,
         "skip_h2h": skip_h2h,
@@ -651,6 +711,7 @@ fn main() {
             mcts_exploration,
             beam_width,
             beam_depth,
+            engines,
             h2h_positions,
             h2h_seeds,
             skip_h2h,
@@ -671,6 +732,7 @@ fn main() {
                 mcts_exploration,
                 beam_width,
                 beam_depth,
+                engines,
             },
             seeds,
             seed_base,
@@ -690,5 +752,55 @@ fn main() {
     if let Err(message) = result {
         eprintln!("error: {message}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_selection_accepts_aliases_and_preserves_requested_order() {
+        let adapters = build_adapters(&RunArgs {
+            family: "native".to_string(),
+            time_limit: 1.0,
+            minimax_depth: 4,
+            minimax_time: 0.1,
+            mcts_iterations: 10,
+            mcts_depth: 4,
+            mcts_exploration: 1.414,
+            beam_width: 8,
+            beam_depth: 4,
+            engines: vec!["mcts".to_string(), "minmax".to_string()],
+        })
+        .unwrap();
+
+        let names: Vec<&str> = adapters.iter().map(|adapter| adapter.name()).collect();
+        assert_eq!(names, vec!["mcts", "minimax"]);
+    }
+
+    #[test]
+    fn engine_selection_rejects_unknown_engines() {
+        let result = build_adapters(&RunArgs {
+            family: "native".to_string(),
+            time_limit: 1.0,
+            minimax_depth: 4,
+            minimax_time: 0.1,
+            mcts_iterations: 10,
+            mcts_depth: 4,
+            mcts_exploration: 1.414,
+            beam_width: 8,
+            beam_depth: 4,
+            engines: vec!["mcts".to_string(), "quantum".to_string()],
+        });
+        let err = match result {
+            Ok(_) => panic!("unknown engine should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.contains("unknown engine"), "{err}");
+        assert!(err.contains("minimax"), "{err}");
+        assert!(err.contains("mcts"), "{err}");
+        assert!(err.contains("beam"), "{err}");
     }
 }
