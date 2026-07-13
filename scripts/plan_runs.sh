@@ -130,6 +130,10 @@ case "$command" in
     for raw_engines in "${engine_set_values[@]}"; do
       engines="$(normalize_engines "$raw_engines")"
       engine_count="$(count_csv "$engines")"
+      if [[ "$engine_count" -lt 2 ]]; then
+        printf 'error: --engines must include at least two engines for h2h planning\n' >&2
+        exit 2
+      fi
       pair_count=$((engine_count * (engine_count - 1) / 2))
       h2h_seeds="$(ceil_div "$games" "$((positions * pair_count * 2))")"
       for mcts_iterations in "${mcts_values[@]}"; do
@@ -167,4 +171,3 @@ case "$command" in
     exit 2
     ;;
 esac
-

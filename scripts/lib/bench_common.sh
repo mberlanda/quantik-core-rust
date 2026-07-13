@@ -99,9 +99,9 @@ cross_engine_cmd() {
   local flag
   flag="$(profile_flag "$profile")"
   if [[ -n "$flag" ]]; then
-    printf '%s\n' cargo run "$flag" --bin cross_engine_benchmark --
+    print_cmd cargo run "$flag" --bin cross_engine_benchmark --
   else
-    printf '%s\n' cargo run --bin cross_engine_benchmark --
+    print_cmd cargo run --bin cross_engine_benchmark --
   fi
 }
 
@@ -113,4 +113,3 @@ require_value() {
     exit 2
   fi
 }
-

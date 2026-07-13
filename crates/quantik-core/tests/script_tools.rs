@@ -20,6 +20,20 @@ fn run_script(script: &str, args: &[&str]) -> (bool, String) {
     (output.status.success(), text)
 }
 
+fn run_bash(command: &str) -> (bool, String) {
+    let output = Command::new("bash")
+        .arg("--noprofile")
+        .arg("--norc")
+        .arg("-c")
+        .arg(command)
+        .current_dir(repo_root())
+        .output()
+        .expect("bash command should run");
+    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    (output.status.success(), text)
+}
+
 #[test]
 fn benchmark_scripts_have_help() {
     for script in [
@@ -55,6 +69,44 @@ fn plan_runs_calculates_h2h_position_seed_combinations() {
     assert!(text.contains("h2h_positions=50"), "{text}");
     assert!(text.contains("h2h_seeds=10"), "{text}");
     assert!(text.contains("planned_games=1000"), "{text}");
+}
+
+#[test]
+fn plan_runs_matrix_rejects_single_engine_sets() {
+    let (success, text) = run_script(
+        "plan_runs.sh",
+        &[
+            "matrix",
+            "--games",
+            "1000",
+            "--engines",
+            "mcts",
+            "--positions",
+            "50",
+        ],
+    );
+
+    assert!(
+        !success,
+        "single-engine matrix planning unexpectedly passed:\n{text}"
+    );
+    assert!(
+        text.contains("--engines must include at least two engines for h2h planning"),
+        "{text}"
+    );
+    assert!(!text.contains("denominator must be positive"), "{text}");
+}
+
+#[test]
+fn cross_engine_cmd_prints_one_shell_command_line() {
+    let (success, text) = run_bash("source scripts/lib/bench_common.sh; cross_engine_cmd release");
+
+    assert!(success, "cross_engine_cmd failed:\n{text}");
+    assert_eq!(
+        text.trim(),
+        "cargo run --release --bin cross_engine_benchmark --"
+    );
+    assert_eq!(text.lines().count(), 1, "{text}");
 }
 
 #[test]
