@@ -82,7 +82,7 @@ authors = ["Mauro Berlanda <mauro.berlanda@gmail.com>"]
 ```
 
 Notes on choices, so a reviewer isn't left guessing:
-- `version` stays `0.1.0` rather than mirroring the Python package's `1.0.0` — this is a brand-new public crate with no external consumers yet, and starting pre-1.0 while the API can still shift without a breaking-change ceremony is standard Rust practice, not a departure from "the same convention." The *naming, license, and CI shape* mirror Python; the version number is an independent decision.
+- `version` is `1.0.0`, mirroring the Python package's version exactly (superseding an earlier draft of this plan that argued for starting pre-1.0 — the repo owner overrode that in favor of consistent versioning across both languages, so this is now `1.0.0` and later Task 3/4 references below use `1.0.0`/`1.0.1` accordingly, not `0.1.0`/`0.1.1`).
 - `keywords` is capped at 5 by crates.io (verified: Python's `pyproject.toml` lists 9; this is the closest 5 that survive the cap without becoming redundant with each other).
 - `categories` uses crates.io's actual category slugs (verified via `GET /api/v1/categories`): `game-development` (closest match to Python's "Games/Entertainment :: Board Games") and `algorithms` (closest match to "Scientific/Engineering :: Artificial Intelligence" — this crate's minimax/MCTS/beam search are literally algorithm implementations, `game-engines` is for one-stop-shop engines like Bevy and doesn't fit a focused state/search library).
 - `rust-version` (MSRV) is deliberately omitted: no MSRV has been verified against an older toolchain in this repository, and asserting an unverified floor would be worse than omitting the field. If a future task verifies one (e.g. via `cargo-msrv` or CI matrix testing), add it then.
@@ -146,7 +146,7 @@ Expected: a file listing that includes `Cargo.toml`, `README.md`, `src/**/*.rs`,
 cargo publish --dry-run
 ```
 
-Expected: `Packaging quantik-core v0.1.0` followed by `Uploading quantik-core v0.1.0 (dry run)` with no errors. If this fails on the `readme` field specifically, that confirms the cross-directory-path concern above — the fix is already applied by Step 3 (crate-local README), so a failure here means Step 3 wasn't done correctly, not that a new approach is needed.
+Expected: `Packaging quantik-core v1.0.0` followed by `Uploading quantik-core v1.0.0 (dry run)` with no errors. If this fails on the `readme` field specifically, that confirms the cross-directory-path concern above — the fix is already applied by Step 3 (crate-local README), so a failure here means Step 3 wasn't done correctly, not that a new approach is needed.
 
 - [ ] **Step 5: Run full CI gates**
 
@@ -282,7 +282,7 @@ This task requires the repo owner's personal crates.io account. No agent can per
    cd crates/quantik-core
    cargo publish
    ```
-   This performs the first, manual publish of `quantik-core` v0.1.0 to crates.io.
+   This performs the first, manual publish of `quantik-core` v1.0.0 to crates.io.
 4. In the crates.io web UI, go to the `quantik-core` crate page → Settings → Trusted Publishing, and add a GitHub Actions publisher with:
    - **Repository owner:** `mberlanda`
    - **Repository name:** `quantik-core-rust`
@@ -306,9 +306,9 @@ This task requires the repo owner's personal crates.io account. No agent can per
 
 - [ ] **Step 1: Bump the version and move the CHANGELOG's Unreleased section**
 
-In `crates/quantik-core/Cargo.toml`, bump `version = "0.1.0"` to `version = "0.1.1"`.
+In `crates/quantik-core/Cargo.toml`, bump `version = "1.0.0"` to `version = "1.0.1"`.
 
-In `CHANGELOG.md`, rename the current `## Unreleased` heading to `## 0.1.1 - <today's date>` and add a fresh empty `## Unreleased` section above it, matching this repo's existing CHANGELOG convention (already visible in the file's current structure).
+In `CHANGELOG.md`, add a fresh `## 1.0.1 - <today's date>` heading below the current empty `## Unreleased` section (matching this repo's existing CHANGELOG convention).
 
 - [ ] **Step 2: Run full CI gates, commit, push, tag**
 
@@ -318,16 +318,16 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features --locked
 cargo build --workspace --all-targets --release --locked
 git add crates/quantik-core/Cargo.toml CHANGELOG.md
-git commit -m "chore: release quantik-core v0.1.1"
+git commit -m "chore: release quantik-core v1.0.1"
 git push
-git tag v0.1.1
-git push origin v0.1.1
+git tag v1.0.1
+git push origin v1.0.1
 ```
 
 - [ ] **Step 3: Publish a GitHub Release from the tag**
 
 ```bash
-gh release create v0.1.1 --title v0.1.1 --generate-notes
+gh release create v1.0.1 --title v1.0.1 --generate-notes
 ```
 
 - [ ] **Step 4: Confirm the workflow ran and published successfully**
@@ -340,7 +340,7 @@ gh run view --log <run-id> | grep -A5 "Publish to crates.io"
 Expected: the `publish-crate` job succeeded, and:
 
 ```bash
-curl -s -H "User-Agent: quantik-core-rust-verify" "https://crates.io/api/v1/crates/quantik-core/0.1.1"
+curl -s -H "User-Agent: quantik-core-rust-verify" "https://crates.io/api/v1/crates/quantik-core/1.0.1"
 ```
 
 returns the new version, confirming the tokenless, trusted-publishing path works end-to-end.

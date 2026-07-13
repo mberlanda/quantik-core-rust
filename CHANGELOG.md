@@ -4,6 +4,12 @@ All notable changes to `quantik-core` are documented here.
 
 ## Unreleased
 
+## 1.0.0 - 2026-07-13
+
+First published release, mirroring the versioning of the sibling Python
+`quantik-core` package rather than starting pre-1.0 — everything below
+accumulated since this crate's creation.
+
 ### Added
 
 - Added crates.io publication metadata to `crates/quantik-core/Cargo.toml`

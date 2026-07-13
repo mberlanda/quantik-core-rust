@@ -1,6 +1,6 @@
 [package]
 name = "quantik-core"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "High-performance Quantik board game engine: bitboard state, QFEN notation, canonical symmetry-reduced keys, and minimax/MCTS/beam-search engines. Rust companion to the Python quantik-core package."
 license = "MIT"
