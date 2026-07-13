@@ -23,9 +23,9 @@
 
 | Task | PR | Status |
 |---|---|---|
-| 1 crates.io metadata (Cargo.toml, LICENSE) | | Not started |
-| 2 Trusted-publishing CI workflow | | Not started |
-| 3 Manual initial publish + Trusted Publisher config (human-only) | | Not started |
+| 1 crates.io metadata (Cargo.toml, LICENSE) | #16 | MERGED (combined with Task 2 and README updates in one PR) |
+| 2 Trusted-publishing CI workflow | #16 | MERGED; `publish-crate` job present but will fail until Task 3 is done |
+| 3 Manual initial publish + Trusted Publisher config (human-only) | | **Blocked on repo owner** — see runbook below |
 | 4 Verify automated publish via a patch release | | Not started |
 | 5 Expose MCTS root-move visit-count distribution | | Not started |
 | 6 Self-play dataset exporter | | Not started |
