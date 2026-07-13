@@ -25,8 +25,8 @@
 |---|---|---|
 | 1 crates.io metadata (Cargo.toml, LICENSE) | #16 | MERGED (combined with Task 2 and README updates in one PR) |
 | 2 Trusted-publishing CI workflow | #16 | MERGED; `publish-crate` job present but will fail until Task 3 is done |
-| 3 Manual initial publish + Trusted Publisher config (human-only) | | **Blocked on repo owner** — see runbook below |
-| 4 Verify automated publish via a patch release | | Not started |
+| 3 Manual initial publish + Trusted Publisher config (human-only) | | Publish half DONE: `quantik-core v1.0.0` is live on crates.io (published manually, 2026-07-13). Trusted Publisher configuration **deferred by repo owner's choice** — manual `cargo publish` per release is acceptable going forward, so this is not blocking further work. |
+| 4 Verify automated publish via a patch release | | **Deferred** — depends on Trusted Publisher config, which is deferred (see Task 3). Revisit if/when trusted publishing is wanted. |
 | 5 Expose MCTS root-move visit-count distribution | | Not started |
 | 6 Self-play dataset exporter | | Not started |
 
