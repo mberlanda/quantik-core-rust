@@ -133,6 +133,27 @@ impl MCTSEngine {
         self.best_move(bb)
     }
 
+    /// Visit-count distribution over the root's legal moves from the most
+    /// recent `search()` call — the raw material for an AlphaZero-style
+    /// soft policy target (`visits / total_visits` per move), as opposed
+    /// to the single argmax move `search()` returns. Empty if `search()`
+    /// returned `None` (no legal moves) or hasn't been called yet.
+    pub fn root_move_visits(&self) -> Vec<(Move, u32)> {
+        let Some(root) = self.nodes.first() else {
+            return Vec::new();
+        };
+        root.children
+            .iter()
+            .map(|&child_idx| {
+                let child = &self.nodes[child_idx];
+                (
+                    child.mv.expect("child node always has a move"),
+                    child.visit_count,
+                )
+            })
+            .collect()
+    }
+
     /// Descend by UCB1 from `node_id`, returning the visited path
     /// (root..=leaf). Backpropagation follows this exact path — with
     /// transposition merging a node can have several parents, so parent
@@ -350,6 +371,62 @@ mod tests {
         assert!(mv.shape < 4);
         assert!(mv.position < 16);
         assert!((0.0..=1.0).contains(&prob));
+    }
+
+    #[test]
+    fn root_move_visits_covers_every_legal_move_and_sums_to_iterations() {
+        let bb = Bitboard::EMPTY;
+        let legal = generate_legal_moves(&bb);
+
+        // Transposition merging is disabled for this test: on the empty
+        // board, `search()`'s default `use_transposition_table: true`
+        // canonicalizes away board/shape symmetry so aggressively that the
+        // 64 legal first moves collapse into just 3 canonical tree nodes
+        // (verified empirically), which would defeat the per-move
+        // accounting this test is checking. `root_move_visits` itself does
+        // not touch transposition behavior either way.
+        let mut engine = MCTSEngine::new(MCTSConfig {
+            max_iterations: 2000,
+            seed: Some(7),
+            use_transposition_table: false,
+            ..Default::default()
+        });
+        let (best_move, _win_prob) = engine.search(&bb).expect("legal moves exist");
+
+        let visits = engine.root_move_visits();
+
+        // Every legal root move was expanded at least once (2000 iterations
+        // against a 64-move branching factor is far more than one pass).
+        assert_eq!(visits.len(), legal.len());
+        let visited_moves: std::collections::HashSet<Move> =
+            visits.iter().map(|(mv, _)| *mv).collect();
+        for mv in &legal {
+            assert!(
+                visited_moves.contains(mv),
+                "missing {mv:?} from root_move_visits"
+            );
+        }
+
+        // Visit counts sum to the iterations actually performed (root gets
+        // one visit per iteration via the selection pass starting there).
+        let total_visits: u32 = visits.iter().map(|(_, v)| v).sum();
+        assert_eq!(total_visits, 2000);
+
+        // The move search() actually returned must be among the visited
+        // moves, and must have the maximum visit count (search() picks by
+        // visit count, not raw value).
+        let best_visits = visits
+            .iter()
+            .find(|(mv, _)| *mv == best_move)
+            .map(|(_, v)| *v)
+            .unwrap();
+        assert!(visits.iter().all(|(_, v)| *v <= best_visits));
+    }
+
+    #[test]
+    fn root_move_visits_empty_before_search() {
+        let engine = MCTSEngine::new(MCTSConfig::default());
+        assert!(engine.root_move_visits().is_empty());
     }
 
     #[test]
