@@ -27,8 +27,8 @@
 | 2 Trusted-publishing CI workflow | #16 | MERGED; `publish-crate` job present but will fail until Task 3 is done |
 | 3 Manual initial publish + Trusted Publisher config (human-only) | | Publish half DONE: `quantik-core v1.0.0` is live on crates.io (published manually, 2026-07-13). Trusted Publisher configuration **deferred by repo owner's choice** — manual `cargo publish` per release is acceptable going forward, so this is not blocking further work. |
 | 4 Verify automated publish via a patch release | | **Deferred** — depends on Trusted Publisher config, which is deferred (see Task 3). Revisit if/when trusted publishing is wanted. |
-| 5 Expose MCTS root-move visit-count distribution | | Not started |
-| 6 Self-play dataset exporter | | Not started |
+| 5 Expose MCTS root-move visit-count distribution | #18 | MERGED. Opus review caught a real MAJOR issue not in the original spec: under the engine's real default config (transposition table on), `root_move_visits` silently collapses symmetric root moves (empty board: 64 legal moves -> 3 entries), which would have corrupted every self-play game's ply-0 policy target. Fixed pre-merge: doc comment caveat + a test asserting the exact collapse. Task 6's spec below is updated accordingly (`use_transposition_table: false`). |
+| 6 Self-play dataset exporter | | Not started — spec updated to require `use_transposition_table: false` per Task 5's finding |
 
 ## Delegation Protocol
 
@@ -581,9 +581,22 @@ fn play_game(seed: u64, iterations: u32) -> (Vec<PendingRow>, WinStatus) {
         }
 
         let side_to_move = current_player(&bb).unwrap();
+        // use_transposition_table MUST be false here: with it on (the
+        // engine's actual default), root moves that canonicalize to the
+        // same child are merged onto one shared node and reported under a
+        // single arbitrary move, silently dropping every other legal move
+        // that led there — worst exactly at shallow plies (the empty
+        // board's 64 legal moves collapse to 3), which every self-play
+        // game passes through. Verified in mcts.rs's
+        // root_move_visits_default_config_collapses_symmetric_root_moves
+        // test — this is not a hypothetical concern, it was caught by
+        // Opus review of the PR that added root_move_visits and is
+        // exactly what this exporter must avoid to produce a faithful
+        // per-legal-move policy target.
         let mut engine = MCTSEngine::new(MCTSConfig {
             max_iterations: iterations,
             seed: Some(seed.wrapping_add(ply as u64)),
+            use_transposition_table: false,
             ..Default::default()
         });
         let (best_move, _) = engine.search(&bb).expect("legal moves exist");
