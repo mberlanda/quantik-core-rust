@@ -138,6 +138,20 @@ impl MCTSEngine {
     /// soft policy target (`visits / total_visits` per move), as opposed
     /// to the single argmax move `search()` returns. Empty if `search()`
     /// returned `None` (no legal moves) or hasn't been called yet.
+    ///
+    /// **With `use_transposition_table` enabled (the default), this is NOT
+    /// one entry per legal move.** Root moves that canonicalize to the same
+    /// child state are merged onto one shared node, reported under a single
+    /// arbitrary "first discovered" move — every other legal move that led
+    /// there is silently absent, not just uncounted. This is worst exactly
+    /// where self-play data collection needs it most: the empty board's 64
+    /// legal first moves collapse to 3 entries (see
+    /// `root_move_visits_default_config_collapses_symmetric_root_moves`
+    /// below, and `docs/benchmarks/quantik-game-tree-census-2026-07-13.md`
+    /// for how orbit size — and therefore collapse severity — shrinks with
+    /// depth but is large at the shallow plies every game starts from). For
+    /// a faithful per-legal-move policy target, run `search()` with
+    /// `use_transposition_table: false`.
     pub fn root_move_visits(&self) -> Vec<(Move, u32)> {
         let Some(root) = self.nodes.first() else {
             return Vec::new();
@@ -427,6 +441,50 @@ mod tests {
     fn root_move_visits_empty_before_search() {
         let engine = MCTSEngine::new(MCTSConfig::default());
         assert!(engine.root_move_visits().is_empty());
+    }
+
+    #[test]
+    fn root_move_visits_default_config_collapses_symmetric_root_moves() {
+        // Documents, deliberately, the exact limitation described in
+        // `root_move_visits`'s doc comment: under the engine's actual
+        // default (`use_transposition_table: true`, i.e. `..Default::
+        // default()` with no override — what every real caller in this
+        // crate uses), the empty board's 64 legal first moves canonicalize
+        // onto just 3 shared tree nodes (matches the independently
+        // cross-validated depth-1 canonical count in
+        // docs/benchmarks/quantik-game-tree-census-2026-07-13.md: "3
+        // canonical states, 64 raw boards"). A caller building a per-move
+        // policy target from this output without disabling the
+        // transposition table would silently drop 61 of 64 legal moves and
+        // mislabel the rest — this test exists so that fact is asserted
+        // and visible, not discovered later against real training data.
+        let bb = Bitboard::EMPTY;
+        let legal = generate_legal_moves(&bb);
+        assert_eq!(legal.len(), 64);
+
+        let mut engine = MCTSEngine::new(MCTSConfig {
+            max_iterations: 2000,
+            seed: Some(7),
+            ..Default::default() // use_transposition_table: true, the real default
+        });
+        engine.search(&bb).expect("legal moves exist");
+
+        let visits = engine.root_move_visits();
+        assert_eq!(
+            visits.len(),
+            3,
+            "expected the empty board's legal moves to collapse to 3 canonical \
+             nodes under the default (transposition-table-enabled) config; if \
+             this changes, root_move_visits's doc comment and Task 6 of \
+             docs/superpowers/plans/2026-07-13-crates-io-packaging-and-ml-data-pipeline.md \
+             need to be re-checked, not just this assertion"
+        );
+
+        let total_visits: u32 = visits.iter().map(|(_, v)| v).sum();
+        assert_eq!(
+            total_visits, 2000,
+            "visit mass is preserved even though move identity is not"
+        );
     }
 
     #[test]
