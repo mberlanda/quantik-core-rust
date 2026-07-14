@@ -56,6 +56,25 @@ By default this script passes `--skip-h2h`, so it records observation rows
 without playing head-to-head games. Add `--include-h2h` when you want one run
 to produce both observations and games.
 
+Export contract-owned rows from the resulting bundle or checkpoint:
+
+```sh
+scripts/export_contract_rows.sh \
+  --input benchmarks/results/mcts-minimax-observations-ckpt \
+  --dataset benchmarks/positions-1000.json \
+  --observations-output benchmarks/results/observations-v1.jsonl
+```
+
+For H2H runs, also export completed games:
+
+```sh
+scripts/export_contract_rows.sh \
+  --input benchmarks/results/mcts-vs-minimax-ckpt \
+  --dataset benchmarks/positions-1000.json \
+  --observations-output benchmarks/results/observations-v1.jsonl \
+  --games-output benchmarks/results/game-results-v1.jsonl
+```
+
 ## H2H Stats
 
 Plan the parameters for 1000 games between MCTS and minimax:
@@ -118,4 +137,3 @@ scripts/plan_runs.sh matrix \
 
 Use `--dry-run` on the generation scripts when wiring this into a TUI or job
 runner.
-

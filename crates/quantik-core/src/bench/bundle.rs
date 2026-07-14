@@ -4,6 +4,8 @@ use serde_json::{json, Map, Value};
 use std::path::Path;
 use std::process::Command;
 
+use super::contracts::{CONTRACT_VERSION, GAME_RESULT_SCHEMA, OBSERVATION_SCHEMA};
+
 pub const SCHEMA_VERSION: u64 = 1;
 
 fn git_sha() -> String {
@@ -76,8 +78,13 @@ pub fn make_bundle(
         .to_string();
 
     json!({
+        "contract_version": CONTRACT_VERSION,
         "schema_version": SCHEMA_VERSION,
         "started_at": started_at,
+        "artifact_contracts": {
+            "observations": OBSERVATION_SCHEMA,
+            "head_to_head": GAME_RESULT_SCHEMA,
+        },
         "environment": collect_environment(),
         "config": config,
         "dataset": {

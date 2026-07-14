@@ -17,6 +17,7 @@ use quantik_core::bench::checkpoint::{
     append_jsonl, build_manifest, bundle_from_checkpoint, checkpoint_paths, key_set, load_jsonl,
     load_manifest, update_manifest_counts, validate_resume_manifest, write_manifest,
 };
+use quantik_core::bench::contracts::{export_game_result_rows, export_observation_rows};
 use quantik_core::bench::correctness::run_preflight;
 use quantik_core::bench::head_to_head::{
     aggregate_head_to_head, h2h_key, run_head_to_head, H2hKey,
@@ -154,6 +155,24 @@ enum Commands {
         input: PathBuf,
         #[arg(long)]
         db: PathBuf,
+    },
+    /// Project benchmark bundle/checkpoint observations to observation.v1 JSONL.
+    ExportObservations {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        dataset: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Project benchmark bundle/checkpoint h2h games to game-result.v1 JSONL.
+    ExportGames {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        dataset: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -677,6 +696,31 @@ fn cmd_export_book(input: &Path, db_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn load_bundle_input(input: &Path) -> Result<Value, String> {
+    if input.is_dir() {
+        bundle_from_checkpoint(input)
+    } else {
+        let text = std::fs::read_to_string(input).map_err(|e| format!("read {input:?}: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
+    }
+}
+
+fn cmd_export_observations(input: &Path, dataset_path: &Path, output: &Path) -> Result<(), String> {
+    let bundle = load_bundle_input(input)?;
+    let dataset_payload = dataset::load(dataset_path)?;
+    let count = export_observation_rows(&bundle, &dataset_payload, output)?;
+    println!("export-observations: {count} rows -> {}", output.display());
+    Ok(())
+}
+
+fn cmd_export_games(input: &Path, dataset_path: &Path, output: &Path) -> Result<(), String> {
+    let bundle = load_bundle_input(input)?;
+    let dataset_payload = dataset::load(dataset_path)?;
+    let count = export_game_result_rows(&bundle, &dataset_payload, output)?;
+    println!("export-games: {count} rows -> {}", output.display());
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -747,6 +791,16 @@ fn main() {
         ),
         Commands::Report { input, output } => cmd_report(&input, output),
         Commands::ExportBook { input, db } => cmd_export_book(&input, &db),
+        Commands::ExportObservations {
+            input,
+            dataset,
+            output,
+        } => cmd_export_observations(&input, &dataset, &output),
+        Commands::ExportGames {
+            input,
+            dataset,
+            output,
+        } => cmd_export_games(&input, &dataset, &output),
     };
 
     if let Err(message) = result {
