@@ -12,14 +12,17 @@ use crate::game::current_player;
 use crate::moves::generate_legal_moves;
 use crate::state::State;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 
 pub const CONTRACT_VERSION: &str = "1.1.0";
 pub const MODEL_CHECKPOINT_CONTRACT_VERSION: &str = "1.1.0";
-pub const OBSERVATION_CONTRACT_VERSION: &str = "1.0.0";
-pub const GAME_RESULT_CONTRACT_VERSION: &str = "1.0.0";
+pub const SELFPLAY_CONTRACT_VERSION: &str = "1.1.0";
+pub const OBSERVATION_CONTRACT_VERSION: &str = "1.1.0";
+pub const GAME_RESULT_CONTRACT_VERSION: &str = "1.1.0";
+pub const SELFPLAY_SCHEMA: &str = "selfplay.v1";
+pub const ARROW_PARQUET_SELFPLAY_SCHEMA: &str = "arrow-parquet-selfplay.v1";
 pub const OPENING_BOOK_SCHEMA: &str = "opening-book.v1";
 pub const OBSERVATION_SCHEMA: &str = "observation.v1";
 pub const GAME_RESULT_SCHEMA: &str = "game-result.v1";
@@ -29,9 +32,9 @@ const SUPPORTED_MODEL_INPUT_CONTRACTS: &[&str] = &[
     "qfen.v1",
     "bitboard.v1",
     "action-index.v1",
-    "selfplay.v1",
+    SELFPLAY_SCHEMA,
     "tensor-board.v1",
-    "arrow-parquet-selfplay.v1",
+    ARROW_PARQUET_SELFPLAY_SCHEMA,
     OPENING_BOOK_SCHEMA,
     "opening-book-summary.v1",
     OBSERVATION_SCHEMA,
@@ -59,6 +62,29 @@ pub struct ModelCheckpointManifest {
     pub legal_action_mask_required: Option<bool>,
     pub recommended_engine_order: Option<Vec<String>>,
     pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfPlayPolicyVisit {
+    pub shape: u8,
+    pub position: u8,
+    pub visits: u32,
+}
+
+impl SelfPlayPolicyVisit {
+    pub fn action_index(&self) -> usize {
+        action_index(self.shape, self.position) as usize
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelfPlayRow {
+    pub game_id: u64,
+    pub ply: u64,
+    pub qfen: String,
+    pub side_to_move: u8,
+    pub policy: Vec<SelfPlayPolicyVisit>,
+    pub value: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -198,6 +224,133 @@ impl ModelCheckpointManifest {
 
 pub fn parse_model_checkpoint_manifest(text: &str) -> Result<ModelCheckpointManifest, String> {
     ModelCheckpointManifest::from_json_str(text)
+}
+
+pub fn parse_selfplay_row(value: &Value) -> Result<SelfPlayRow, String> {
+    let object = value
+        .as_object()
+        .ok_or("selfplay row must be a JSON object")?;
+    validate_schema_with_optional_version(object, SELFPLAY_SCHEMA, CONTRACT_VERSION)?;
+
+    let game_id = required_u64(object, "game_id")?;
+    let ply = required_u64(object, "ply")?;
+    let qfen = required_string(object, "qfen")?;
+    let side_to_move = required_u8(object, "side_to_move")?;
+    if side_to_move > 1 {
+        return Err("side_to_move must be 0 or 1".to_string());
+    }
+
+    let state = State::from_qfen(&qfen)?;
+    let expected_side =
+        current_player(&state.bb).ok_or_else(|| "side_to_move does not match qfen".to_string())?;
+    if expected_side != side_to_move {
+        return Err("side_to_move does not match qfen".to_string());
+    }
+
+    let policy = required_selfplay_policy(object, "policy")?;
+    validate_selfplay_policy_is_legal(&state.bb, &policy)?;
+
+    let value = required_f64(object, "value")?;
+    if value != -1.0 && value != 1.0 {
+        return Err("value must be exactly -1.0 or 1.0".to_string());
+    }
+
+    Ok(SelfPlayRow {
+        game_id,
+        ply,
+        qfen,
+        side_to_move,
+        policy,
+        value,
+    })
+}
+
+pub fn selfplay_dense_policy_visits(policy: &[SelfPlayPolicyVisit]) -> Result<[u32; 64], String> {
+    if policy.is_empty() {
+        return Err("policy must be non-empty".to_string());
+    }
+    let mut dense = [0u32; 64];
+    for visit in policy {
+        if visit.shape > 3 {
+            return Err("policy shape must be in 0..3".to_string());
+        }
+        if visit.position > 15 {
+            return Err("policy position must be in 0..15".to_string());
+        }
+        if visit.visits == 0 {
+            return Err("policy visits must be positive".to_string());
+        }
+        let action = visit.action_index();
+        dense[action] = dense[action]
+            .checked_add(visit.visits)
+            .ok_or_else(|| format!("policy visits overflow at action {action}"))?;
+    }
+    Ok(dense)
+}
+
+pub fn selfplay_arrow_parquet_record(row: &SelfPlayRow) -> Result<Value, String> {
+    if row.ply > u16::MAX as u64 {
+        return Err("ply must fit in uint16 for arrow-parquet-selfplay.v1".to_string());
+    }
+    selfplay_v1_row(
+        row.game_id,
+        row.ply,
+        &row.qfen,
+        row.side_to_move,
+        &row.policy,
+        row.value,
+    )?;
+    let state = State::from_qfen(&row.qfen)?;
+    let value = if row.value == 1.0 {
+        1i8
+    } else if row.value == -1.0 {
+        -1i8
+    } else {
+        return Err("value must be exactly -1.0 or 1.0".to_string());
+    };
+    let policy_visits = selfplay_dense_policy_visits(&row.policy)?.to_vec();
+
+    Ok(json!({
+        "logical_schema": SELFPLAY_SCHEMA,
+        "contract_version": SELFPLAY_CONTRACT_VERSION,
+        "game_id": row.game_id,
+        "ply": row.ply,
+        "side_to_move": row.side_to_move,
+        "bitboards": state.bb.planes,
+        "policy_visits": policy_visits,
+        "value": value,
+        "qfen": row.qfen,
+    }))
+}
+
+pub fn selfplay_v1_row(
+    game_id: u64,
+    ply: u64,
+    qfen: &str,
+    side_to_move: u8,
+    policy: &[SelfPlayPolicyVisit],
+    value: f64,
+) -> Result<Value, String> {
+    let mut policy_json = Vec::with_capacity(policy.len());
+    for visit in policy {
+        policy_json.push(json!({
+            "shape": visit.shape,
+            "position": visit.position,
+            "visits": visit.visits,
+        }));
+    }
+    let record = json!({
+        "schema": SELFPLAY_SCHEMA,
+        "contract_version": CONTRACT_VERSION,
+        "game_id": game_id,
+        "ply": ply,
+        "qfen": qfen,
+        "side_to_move": side_to_move,
+        "policy": policy_json,
+        "value": value,
+    });
+    parse_selfplay_row(&record)?;
+    Ok(record)
 }
 
 pub fn parse_observation_row(value: &Value) -> Result<ObservationRow, String> {
@@ -458,6 +611,25 @@ fn validate_contract_shape(
     Ok(())
 }
 
+fn validate_schema_with_optional_version(
+    object: &serde_json::Map<String, Value>,
+    expected_schema: &str,
+    expected_version: &str,
+) -> Result<(), String> {
+    let schema = required_string(object, "schema")?;
+    if schema != expected_schema {
+        return Err(format!("schema must be {expected_schema}, got {schema}"));
+    }
+    if let Some(contract_version) = optional_string(object, "contract_version")? {
+        if contract_version != expected_version {
+            return Err(format!(
+                "contract_version must be {expected_version}, got {contract_version}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn required_u8(object: &serde_json::Map<String, Value>, field: &str) -> Result<u8, String> {
     let value = required_u64(object, field)?;
     u8::try_from(value).map_err(|_| format!("{field} must fit in uint8"))
@@ -521,6 +693,69 @@ fn required_action_index_list(
             Ok(action as u8)
         })
         .collect()
+}
+
+fn required_selfplay_policy(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Vec<SelfPlayPolicyVisit>, String> {
+    let value = object
+        .get(field)
+        .ok_or_else(|| format!("{field} is required"))?;
+    let array = value
+        .as_array()
+        .ok_or_else(|| format!("{field} must be a non-empty list"))?;
+    if array.is_empty() {
+        return Err(format!("{field} must be a non-empty list"));
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut visits = Vec::with_capacity(array.len());
+    for (index, item) in array.iter().enumerate() {
+        let item_object = item
+            .as_object()
+            .ok_or_else(|| format!("{field}[{index}] must be an object"))?;
+        let shape = required_u8(item_object, "shape")?;
+        if shape > 3 {
+            return Err(format!("{field}[{index}].shape must be in 0..3"));
+        }
+        let position = required_u8(item_object, "position")?;
+        if position > 15 {
+            return Err(format!("{field}[{index}].position must be in 0..15"));
+        }
+        let visit_count = required_u32(item_object, "visits")?;
+        if visit_count == 0 {
+            return Err(format!("{field}[{index}].visits must be positive"));
+        }
+        if !seen.insert((shape, position)) {
+            return Err(format!(
+                "{field}[{index}] duplicates shape={shape}, position={position}"
+            ));
+        }
+        visits.push(SelfPlayPolicyVisit {
+            shape,
+            position,
+            visits: visit_count,
+        });
+    }
+    Ok(visits)
+}
+
+fn validate_selfplay_policy_is_legal(
+    bitboards: &Bitboard,
+    policy: &[SelfPlayPolicyVisit],
+) -> Result<(), String> {
+    let legal_mask = legal_action_mask(bitboards);
+    for visit in policy {
+        let action = visit.action_index();
+        if ((legal_mask >> action) & 1) == 0 {
+            return Err(format!(
+                "policy action is not legal for row state: shape={}, position={}",
+                visit.shape, visit.position
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn required_bitboards(
@@ -876,7 +1111,7 @@ mod tests {
         });
         let valid = observation_v1_row(0, "run", &row, &positions["p0000"]).unwrap();
         let cases = [
-            ("bad version", json!({"contract_version": "1.1.0"})),
+            ("bad version", json!({"contract_version": "1.0.0"})),
             ("bad schema", json!({"schema": "game-result.v1"})),
             ("bad mask", json!({"legal_action_mask": 0})),
             ("bad confidence", json!({"source_confidence": 1.5})),
@@ -1010,7 +1245,7 @@ mod tests {
         )
         .unwrap();
         let cases = [
-            ("bad version", json!({"contract_version": "1.1.0"})),
+            ("bad version", json!({"contract_version": "1.0.0"})),
             ("bad schema", json!({"schema": "observation.v1"})),
             ("bad winner", json!({"winner": 2})),
             ("bad plies", json!({"plies": 4})),
@@ -1026,6 +1261,119 @@ mod tests {
             let error = parse_game_result_row(&candidate)
                 .expect_err(label)
                 .to_string();
+            assert!(!error.is_empty(), "expected validation error for {label}");
+        }
+    }
+
+    #[test]
+    fn selfplay_row_parses_current_release_fixture_shape() {
+        let row = json!({
+            "schema": SELFPLAY_SCHEMA,
+            "contract_version": SELFPLAY_CONTRACT_VERSION,
+            "game_id": 0,
+            "ply": 1,
+            "qfen": "A.../..../..../....",
+            "side_to_move": 1,
+            "policy": [
+                {"shape": 0, "position": 10, "visits": 2},
+                {"shape": 1, "position": 1, "visits": 6}
+            ],
+            "value": -1.0
+        });
+
+        let parsed = parse_selfplay_row(&row).unwrap();
+
+        assert_eq!(parsed.game_id, 0);
+        assert_eq!(parsed.ply, 1);
+        assert_eq!(parsed.side_to_move, 1);
+        assert_eq!(parsed.policy[0].action_index(), 10);
+        assert_eq!(parsed.policy[1].action_index(), 17);
+        assert_eq!(parsed.value, -1.0);
+
+        let dense = selfplay_dense_policy_visits(&parsed.policy).unwrap();
+        assert_eq!(dense[10], 2);
+        assert_eq!(dense[17], 6);
+        assert_eq!(dense.iter().sum::<u32>(), 8);
+
+        let physical = selfplay_arrow_parquet_record(&parsed).unwrap();
+        assert_eq!(physical["logical_schema"], SELFPLAY_SCHEMA);
+        assert_eq!(
+            physical["contract_version"],
+            json!(SELFPLAY_CONTRACT_VERSION)
+        );
+        assert_eq!(physical["bitboards"], json!([1, 0, 0, 0, 0, 0, 0, 0]));
+        assert_eq!(physical["policy_visits"][10], json!(2));
+        assert_eq!(physical["policy_visits"][17], json!(6));
+        assert_eq!(physical["value"], json!(-1));
+    }
+
+    #[test]
+    fn selfplay_row_builder_emits_release_1_1_0_contract_json() {
+        let row = selfplay_v1_row(
+            7,
+            0,
+            "..../..../..../....",
+            0,
+            &[SelfPlayPolicyVisit {
+                shape: 0,
+                position: 0,
+                visits: 3,
+            }],
+            1.0,
+        )
+        .unwrap();
+
+        assert_eq!(row["schema"], SELFPLAY_SCHEMA);
+        assert_eq!(row["contract_version"], SELFPLAY_CONTRACT_VERSION);
+        assert_eq!(row["game_id"], json!(7));
+        assert_eq!(row["policy"][0]["visits"], json!(3));
+        parse_selfplay_row(&row).unwrap();
+    }
+
+    #[test]
+    fn selfplay_parser_rejects_drifted_or_inconsistent_rows() {
+        let valid = json!({
+            "schema": SELFPLAY_SCHEMA,
+            "contract_version": SELFPLAY_CONTRACT_VERSION,
+            "game_id": 0,
+            "ply": 0,
+            "qfen": "..../..../..../....",
+            "side_to_move": 0,
+            "policy": [{"shape": 0, "position": 0, "visits": 1}],
+            "value": 1.0
+        });
+        let cases = [
+            ("bad schema", json!({"schema": "selfplay.v2"})),
+            ("bad version", json!({"contract_version": "9.9.9"})),
+            ("bad side", json!({"side_to_move": 1})),
+            ("bad value", json!({"value": 0.0})),
+            ("empty policy", json!({"policy": []})),
+            (
+                "illegal policy action",
+                json!({
+                    "qfen": "A.../..../..../....",
+                    "side_to_move": 1,
+                    "policy": [{"shape": 0, "position": 1, "visits": 1}]
+                }),
+            ),
+            (
+                "duplicate policy action",
+                json!({
+                    "policy": [
+                        {"shape": 0, "position": 0, "visits": 1},
+                        {"shape": 0, "position": 0, "visits": 2}
+                    ]
+                }),
+            ),
+        ];
+
+        for (label, patch) in cases {
+            let mut candidate = valid.clone();
+            for (key, value) in patch.as_object().unwrap() {
+                candidate[key] = value.clone();
+            }
+
+            let error = parse_selfplay_row(&candidate).expect_err(label).to_string();
             assert!(!error.is_empty(), "expected validation error for {label}");
         }
     }
