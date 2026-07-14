@@ -104,6 +104,7 @@ pub struct ObservationRow {
     pub legal_action_mask: u64,
     pub engine_kind: String,
     pub engine_version: String,
+    pub elapsed_ms: u32,
     pub policy_visits: Vec<u64>,
     pub value: f64,
     pub value_source: String,
@@ -114,8 +115,11 @@ pub struct ObservationRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameResultRow {
     pub game_id: String,
+    pub started_at: String,
     pub p0_engine_kind: String,
+    pub p0_engine_version: String,
     pub p1_engine_kind: String,
+    pub p1_engine_version: String,
     pub initial_position_key: String,
     pub winner: u8,
     pub plies: u64,
@@ -555,6 +559,391 @@ pub fn read_selfplay_arrow_parquet<P: AsRef<Path>>(path: P) -> Result<Vec<SelfPl
     Ok(rows)
 }
 
+#[cfg(feature = "arrow-parquet")]
+pub fn write_observations_parquet<P: AsRef<Path>>(
+    path: P,
+    rows: &[ObservationRow],
+) -> Result<(), String> {
+    use arrow_array::{
+        ArrayRef, FixedSizeListArray, Float64Array, RecordBatch, StringArray, UInt16Array,
+        UInt32Array, UInt64Array, UInt8Array,
+    };
+    use arrow_schema::{DataType, Field};
+    use parquet::arrow::arrow_writer::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
+
+    let schema = observation_parquet_schema();
+    let mut physical_schema = Vec::with_capacity(rows.len());
+    let mut contract_version = Vec::with_capacity(rows.len());
+    let mut run_id = Vec::with_capacity(rows.len());
+    let mut row_id = Vec::with_capacity(rows.len());
+    let mut position_key = Vec::with_capacity(rows.len());
+    let mut ply = Vec::with_capacity(rows.len());
+    let mut side_to_move = Vec::with_capacity(rows.len());
+    let mut bitboards = Vec::with_capacity(rows.len() * 8);
+    let mut qfen = Vec::with_capacity(rows.len());
+    let mut legal_action_mask = Vec::with_capacity(rows.len());
+    let mut engine_kind = Vec::with_capacity(rows.len());
+    let mut engine_version = Vec::with_capacity(rows.len());
+    let mut elapsed_ms = Vec::with_capacity(rows.len());
+    let mut policy_visits = Vec::with_capacity(rows.len() * 64);
+    let mut value = Vec::with_capacity(rows.len());
+    let mut value_source = Vec::with_capacity(rows.len());
+    let mut source_confidence = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let _record = observation_record_from_row(row)?;
+        physical_schema.push(OBSERVATION_SCHEMA.to_string());
+        contract_version.push(OBSERVATION_CONTRACT_VERSION.to_string());
+        run_id.push(row.run_id.clone());
+        row_id.push(row.row_id);
+        position_key.push(row.position_key.clone());
+        ply.push(
+            u16::try_from(row.ply)
+                .map_err(|_| "ply must fit in uint16 for observation.v1".to_string())?,
+        );
+        side_to_move.push(row.side_to_move);
+        bitboards.extend(row.bitboards.planes);
+        qfen.push(row.qfen.clone());
+        legal_action_mask.push(row.legal_action_mask);
+        engine_kind.push(row.engine_kind.clone());
+        engine_version.push(row.engine_version.clone());
+        elapsed_ms.push(row.elapsed_ms);
+        policy_visits.extend(observation_policy_visits_u32(&row.policy_visits)?);
+        value.push(row.value);
+        value_source.push(row.value_source.clone());
+        source_confidence.push(row.source_confidence);
+    }
+
+    let bitboards_array = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::UInt16, false)),
+        8,
+        Arc::new(UInt16Array::from(bitboards)),
+        None,
+    )
+    .map_err(|e| format!("build bitboards column: {e}"))?;
+    let policy_visits_array = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::UInt32, false)),
+        64,
+        Arc::new(UInt32Array::from(policy_visits)),
+        None,
+    )
+    .map_err(|e| format!("build policy_visits column: {e}"))?;
+    let qfen_values = qfen
+        .iter()
+        .map(|value| value.as_deref())
+        .collect::<Vec<_>>();
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(physical_schema)) as ArrayRef,
+            Arc::new(StringArray::from(contract_version)) as ArrayRef,
+            Arc::new(StringArray::from(run_id)) as ArrayRef,
+            Arc::new(UInt64Array::from(row_id)) as ArrayRef,
+            Arc::new(StringArray::from(position_key)) as ArrayRef,
+            Arc::new(UInt16Array::from(ply)) as ArrayRef,
+            Arc::new(UInt8Array::from(side_to_move)) as ArrayRef,
+            Arc::new(bitboards_array) as ArrayRef,
+            Arc::new(StringArray::from(qfen_values)) as ArrayRef,
+            Arc::new(UInt64Array::from(legal_action_mask)) as ArrayRef,
+            Arc::new(StringArray::from(engine_kind)) as ArrayRef,
+            Arc::new(StringArray::from(engine_version)) as ArrayRef,
+            Arc::new(UInt32Array::from(elapsed_ms)) as ArrayRef,
+            Arc::new(policy_visits_array) as ArrayRef,
+            Arc::new(Float64Array::from(value)) as ArrayRef,
+            Arc::new(StringArray::from(value_source)) as ArrayRef,
+            Arc::new(Float64Array::from(source_confidence)) as ArrayRef,
+        ],
+    )
+    .map_err(|e| format!("build observation record batch: {e}"))?;
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_key_value_metadata(Some(contract_parquet_metadata(
+            OBSERVATION_SCHEMA,
+            OBSERVATION_CONTRACT_VERSION,
+        )))
+        .build();
+    let file = File::create(path.as_ref())
+        .map_err(|e| format!("create {}: {e}", path.as_ref().display()))?;
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))
+        .map_err(|e| format!("create observation parquet writer: {e}"))?;
+    writer
+        .write(&batch)
+        .map_err(|e| format!("write observation parquet batch: {e}"))?;
+    writer
+        .close()
+        .map_err(|e| format!("close observation parquet writer: {e}"))?;
+    Ok(())
+}
+
+#[cfg(feature = "arrow-parquet")]
+pub fn read_observations_parquet<P: AsRef<Path>>(path: P) -> Result<Vec<ObservationRow>, String> {
+    use arrow_array::Array;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let file =
+        File::open(path.as_ref()).map_err(|e| format!("open {}: {e}", path.as_ref().display()))?;
+    let metadata_reader = SerializedFileReader::new(
+        file.try_clone()
+            .map_err(|e| format!("clone {}: {e}", path.as_ref().display()))?,
+    )
+    .map_err(|e| format!("read parquet metadata: {e}"))?;
+    validate_contract_parquet_metadata(
+        metadata_reader
+            .metadata()
+            .file_metadata()
+            .key_value_metadata(),
+        OBSERVATION_SCHEMA,
+        OBSERVATION_CONTRACT_VERSION,
+    )?;
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("open observation parquet reader: {e}"))?;
+    validate_observation_arrow_schema(builder.schema().as_ref())?;
+    let reader = builder
+        .build()
+        .map_err(|e| format!("build observation parquet reader: {e}"))?;
+    let mut rows = Vec::new();
+
+    for batch in reader {
+        let batch = batch.map_err(|e| format!("read observation parquet batch: {e}"))?;
+        validate_observation_arrow_schema(batch.schema().as_ref())?;
+        let physical_schema = string_column(&batch, 0, "schema")?;
+        let contract_version = string_column(&batch, 1, "contract_version")?;
+        let run_id = string_column(&batch, 2, "run_id")?;
+        let row_id = u64_column(&batch, 3, "row_id")?;
+        let position_key = string_column(&batch, 4, "position_key")?;
+        let ply = u16_column(&batch, 5, "ply")?;
+        let side_to_move = u8_column(&batch, 6, "side_to_move")?;
+        let bitboards = fixed_list_column(&batch, 7, "bitboards", 8)?;
+        let qfen = nullable_string_column(&batch, 8, "qfen")?;
+        let legal_action_mask = u64_column(&batch, 9, "legal_action_mask")?;
+        let engine_kind = string_column(&batch, 10, "engine_kind")?;
+        let engine_version = string_column(&batch, 11, "engine_version")?;
+        let elapsed_ms = u32_column(&batch, 12, "elapsed_ms")?;
+        let policy_visits = fixed_list_column(&batch, 13, "policy_visits", 64)?;
+        let value = f64_column(&batch, 14, "value")?;
+        let value_source = string_column(&batch, 15, "value_source")?;
+        let source_confidence = f64_column(&batch, 16, "source_confidence")?;
+
+        for row_index in 0..batch.num_rows() {
+            let record = json!({
+                "schema": physical_schema.value(row_index),
+                "contract_version": contract_version.value(row_index),
+                "run_id": run_id.value(row_index),
+                "row_id": row_id.value(row_index),
+                "position_key": position_key.value(row_index),
+                "ply": ply.value(row_index),
+                "side_to_move": side_to_move.value(row_index),
+                "bitboards": bitboards_u16_at(bitboards, row_index, "bitboards")?,
+                "qfen": if qfen.is_null(row_index) {
+                    Value::Null
+                } else {
+                    json!(qfen.value(row_index))
+                },
+                "legal_action_mask": legal_action_mask.value(row_index),
+                "engine_kind": engine_kind.value(row_index),
+                "engine_version": engine_version.value(row_index),
+                "elapsed_ms": elapsed_ms.value(row_index),
+                "policy_visits": policy_visits_u32_at(
+                    policy_visits,
+                    row_index,
+                    "policy_visits",
+                )?
+                .to_vec(),
+                "value": value.value(row_index),
+                "value_source": value_source.value(row_index),
+                "source_confidence": source_confidence.value(row_index),
+            });
+            rows.push(parse_observation_row(&record)?);
+        }
+    }
+
+    Ok(rows)
+}
+
+#[cfg(feature = "arrow-parquet")]
+pub fn write_game_results_parquet<P: AsRef<Path>>(
+    path: P,
+    rows: &[GameResultRow],
+) -> Result<(), String> {
+    use arrow_array::builder::{ListBuilder, UInt8Builder};
+    use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt16Array, UInt8Array};
+    use arrow_schema::{DataType, Field};
+    use parquet::arrow::arrow_writer::ArrowWriter;
+    use parquet::basic::Compression;
+    use parquet::file::properties::WriterProperties;
+
+    let schema = game_result_parquet_schema();
+    let mut physical_schema = Vec::with_capacity(rows.len());
+    let mut contract_version = Vec::with_capacity(rows.len());
+    let mut game_id = Vec::with_capacity(rows.len());
+    let mut started_at = Vec::with_capacity(rows.len());
+    let mut p0_engine_kind = Vec::with_capacity(rows.len());
+    let mut p0_engine_version = Vec::with_capacity(rows.len());
+    let mut p1_engine_kind = Vec::with_capacity(rows.len());
+    let mut p1_engine_version = Vec::with_capacity(rows.len());
+    let mut initial_position_key = Vec::with_capacity(rows.len());
+    let mut winner = Vec::with_capacity(rows.len());
+    let mut plies = Vec::with_capacity(rows.len());
+    let mut terminal_reason = Vec::with_capacity(rows.len());
+    let mut move_action_indices = ListBuilder::new(UInt8Builder::new())
+        .with_field(Arc::new(Field::new("item", DataType::UInt8, false)));
+    let mut run_id = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let _record = game_result_record_from_row(row)?;
+        physical_schema.push(GAME_RESULT_SCHEMA.to_string());
+        contract_version.push(GAME_RESULT_CONTRACT_VERSION.to_string());
+        game_id.push(row.game_id.clone());
+        started_at.push(row.started_at.clone());
+        p0_engine_kind.push(row.p0_engine_kind.clone());
+        p0_engine_version.push(row.p0_engine_version.clone());
+        p1_engine_kind.push(row.p1_engine_kind.clone());
+        p1_engine_version.push(row.p1_engine_version.clone());
+        initial_position_key.push(row.initial_position_key.clone());
+        winner.push(row.winner);
+        plies.push(
+            u16::try_from(row.plies)
+                .map_err(|_| "plies must fit in uint16 for game-result.v1".to_string())?,
+        );
+        terminal_reason.push(row.terminal_reason.clone());
+        for action in &row.move_action_indices {
+            move_action_indices.values().append_value(*action);
+        }
+        move_action_indices.append(true);
+        run_id.push(row.run_id.clone());
+    }
+
+    let run_id_values = run_id
+        .iter()
+        .map(|value| value.as_deref())
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(physical_schema)) as ArrayRef,
+            Arc::new(StringArray::from(contract_version)) as ArrayRef,
+            Arc::new(StringArray::from(game_id)) as ArrayRef,
+            Arc::new(StringArray::from(started_at)) as ArrayRef,
+            Arc::new(StringArray::from(p0_engine_kind)) as ArrayRef,
+            Arc::new(StringArray::from(p0_engine_version)) as ArrayRef,
+            Arc::new(StringArray::from(p1_engine_kind)) as ArrayRef,
+            Arc::new(StringArray::from(p1_engine_version)) as ArrayRef,
+            Arc::new(StringArray::from(initial_position_key)) as ArrayRef,
+            Arc::new(UInt8Array::from(winner)) as ArrayRef,
+            Arc::new(UInt16Array::from(plies)) as ArrayRef,
+            Arc::new(StringArray::from(terminal_reason)) as ArrayRef,
+            Arc::new(move_action_indices.finish()) as ArrayRef,
+            Arc::new(StringArray::from(run_id_values)) as ArrayRef,
+        ],
+    )
+    .map_err(|e| format!("build game-result record batch: {e}"))?;
+
+    let props = WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .set_key_value_metadata(Some(contract_parquet_metadata(
+            GAME_RESULT_SCHEMA,
+            GAME_RESULT_CONTRACT_VERSION,
+        )))
+        .build();
+    let file = File::create(path.as_ref())
+        .map_err(|e| format!("create {}: {e}", path.as_ref().display()))?;
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))
+        .map_err(|e| format!("create game-result parquet writer: {e}"))?;
+    writer
+        .write(&batch)
+        .map_err(|e| format!("write game-result parquet batch: {e}"))?;
+    writer
+        .close()
+        .map_err(|e| format!("close game-result parquet writer: {e}"))?;
+    Ok(())
+}
+
+#[cfg(feature = "arrow-parquet")]
+pub fn read_game_results_parquet<P: AsRef<Path>>(path: P) -> Result<Vec<GameResultRow>, String> {
+    use arrow_array::Array;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+
+    let file =
+        File::open(path.as_ref()).map_err(|e| format!("open {}: {e}", path.as_ref().display()))?;
+    let metadata_reader = SerializedFileReader::new(
+        file.try_clone()
+            .map_err(|e| format!("clone {}: {e}", path.as_ref().display()))?,
+    )
+    .map_err(|e| format!("read parquet metadata: {e}"))?;
+    validate_contract_parquet_metadata(
+        metadata_reader
+            .metadata()
+            .file_metadata()
+            .key_value_metadata(),
+        GAME_RESULT_SCHEMA,
+        GAME_RESULT_CONTRACT_VERSION,
+    )?;
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| format!("open game-result parquet reader: {e}"))?;
+    validate_game_result_arrow_schema(builder.schema().as_ref())?;
+    let reader = builder
+        .build()
+        .map_err(|e| format!("build game-result parquet reader: {e}"))?;
+    let mut rows = Vec::new();
+
+    for batch in reader {
+        let batch = batch.map_err(|e| format!("read game-result parquet batch: {e}"))?;
+        validate_game_result_arrow_schema(batch.schema().as_ref())?;
+        let physical_schema = string_column(&batch, 0, "schema")?;
+        let contract_version = string_column(&batch, 1, "contract_version")?;
+        let game_id = string_column(&batch, 2, "game_id")?;
+        let started_at = string_column(&batch, 3, "started_at")?;
+        let p0_engine_kind = string_column(&batch, 4, "p0_engine_kind")?;
+        let p0_engine_version = string_column(&batch, 5, "p0_engine_version")?;
+        let p1_engine_kind = string_column(&batch, 6, "p1_engine_kind")?;
+        let p1_engine_version = string_column(&batch, 7, "p1_engine_version")?;
+        let initial_position_key = string_column(&batch, 8, "initial_position_key")?;
+        let winner = u8_column(&batch, 9, "winner")?;
+        let plies = u16_column(&batch, 10, "plies")?;
+        let terminal_reason = string_column(&batch, 11, "terminal_reason")?;
+        let move_action_indices = list_column(&batch, 12, "move_action_indices")?;
+        let run_id = nullable_string_column(&batch, 13, "run_id")?;
+
+        for row_index in 0..batch.num_rows() {
+            let record = json!({
+                "schema": physical_schema.value(row_index),
+                "contract_version": contract_version.value(row_index),
+                "game_id": game_id.value(row_index),
+                "started_at": started_at.value(row_index),
+                "p0_engine_kind": p0_engine_kind.value(row_index),
+                "p0_engine_version": p0_engine_version.value(row_index),
+                "p1_engine_kind": p1_engine_kind.value(row_index),
+                "p1_engine_version": p1_engine_version.value(row_index),
+                "initial_position_key": initial_position_key.value(row_index),
+                "winner": winner.value(row_index),
+                "plies": plies.value(row_index),
+                "terminal_reason": terminal_reason.value(row_index),
+                "move_action_indices": action_indices_u8_at(
+                    move_action_indices,
+                    row_index,
+                    "move_action_indices",
+                )?,
+                "run_id": if run_id.is_null(row_index) {
+                    Value::Null
+                } else {
+                    json!(run_id.value(row_index))
+                },
+            });
+            rows.push(parse_game_result_row(&record)?);
+        }
+    }
+
+    Ok(rows)
+}
+
 pub fn selfplay_v1_row(
     game_id: u64,
     ply: u64,
@@ -621,7 +1010,7 @@ pub fn parse_observation_row(value: &Value) -> Result<ObservationRow, String> {
         return Err("legal_action_mask does not match bitboards".to_string());
     }
 
-    let _elapsed_ms = required_u32(object, "elapsed_ms")?;
+    let elapsed_ms = required_u32(object, "elapsed_ms")?;
     let policy_visits = required_u64_list(object, "policy_visits", 64)?;
     if legal_mask != 0 && policy_visits.iter().sum::<u64>() == 0 {
         return Err("policy_visits must contain at least one visit".to_string());
@@ -647,6 +1036,7 @@ pub fn parse_observation_row(value: &Value) -> Result<ObservationRow, String> {
         legal_action_mask: legal_mask,
         engine_kind: required_string(object, "engine_kind")?,
         engine_version: required_string(object, "engine_version")?,
+        elapsed_ms,
         policy_visits,
         value: required_f64(object, "value")?,
         value_source: required_string(object, "value_source")?,
@@ -661,9 +1051,9 @@ pub fn parse_game_result_row(value: &Value) -> Result<GameResultRow, String> {
         .ok_or("game-result row must be a JSON object")?;
     validate_contract_shape(object, GAME_RESULT_SCHEMA, GAME_RESULT_CONTRACT_VERSION)?;
 
-    let _started_at = required_string(object, "started_at")?;
-    let _p0_engine_version = required_string(object, "p0_engine_version")?;
-    let _p1_engine_version = required_string(object, "p1_engine_version")?;
+    let started_at = required_string(object, "started_at")?;
+    let p0_engine_version = required_string(object, "p0_engine_version")?;
+    let p1_engine_version = required_string(object, "p1_engine_version")?;
 
     let winner = required_u8(object, "winner")?;
     if winner > 1 {
@@ -680,8 +1070,11 @@ pub fn parse_game_result_row(value: &Value) -> Result<GameResultRow, String> {
 
     Ok(GameResultRow {
         game_id: required_string(object, "game_id")?,
+        started_at,
         p0_engine_kind: required_string(object, "p0_engine_kind")?,
+        p0_engine_version,
         p1_engine_kind: required_string(object, "p1_engine_kind")?,
+        p1_engine_version,
         initial_position_key: required_string(object, "initial_position_key")?,
         winner,
         plies,
@@ -689,6 +1082,51 @@ pub fn parse_game_result_row(value: &Value) -> Result<GameResultRow, String> {
         move_action_indices,
         run_id: optional_string(object, "run_id")?,
     })
+}
+
+fn observation_record_from_row(row: &ObservationRow) -> Result<Value, String> {
+    let record = json!({
+        "schema": OBSERVATION_SCHEMA,
+        "contract_version": OBSERVATION_CONTRACT_VERSION,
+        "run_id": row.run_id,
+        "row_id": row.row_id,
+        "position_key": row.position_key,
+        "ply": row.ply,
+        "side_to_move": row.side_to_move,
+        "bitboards": row.bitboards.planes,
+        "qfen": row.qfen,
+        "legal_action_mask": row.legal_action_mask,
+        "engine_kind": row.engine_kind,
+        "engine_version": row.engine_version,
+        "elapsed_ms": row.elapsed_ms,
+        "policy_visits": row.policy_visits,
+        "value": row.value,
+        "value_source": row.value_source,
+        "source_confidence": row.source_confidence,
+    });
+    parse_observation_row(&record)?;
+    Ok(record)
+}
+
+fn game_result_record_from_row(row: &GameResultRow) -> Result<Value, String> {
+    let record = json!({
+        "schema": GAME_RESULT_SCHEMA,
+        "contract_version": GAME_RESULT_CONTRACT_VERSION,
+        "game_id": row.game_id,
+        "started_at": row.started_at,
+        "p0_engine_kind": row.p0_engine_kind,
+        "p0_engine_version": row.p0_engine_version,
+        "p1_engine_kind": row.p1_engine_kind,
+        "p1_engine_version": row.p1_engine_version,
+        "initial_position_key": row.initial_position_key,
+        "winner": row.winner,
+        "plies": row.plies,
+        "terminal_reason": row.terminal_reason,
+        "move_action_indices": row.move_action_indices,
+        "run_id": row.run_id,
+    });
+    parse_game_result_row(&record)?;
+    Ok(record)
 }
 
 pub fn is_supported_weights_format(weights_format: &str) -> bool {
@@ -1062,6 +1500,82 @@ fn selfplay_arrow_parquet_schema() -> Arc<arrow_schema::Schema> {
 }
 
 #[cfg(feature = "arrow-parquet")]
+fn observation_parquet_schema() -> Arc<arrow_schema::Schema> {
+    use arrow_schema::{DataType, Field, Schema};
+
+    Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("schema", DataType::Utf8, false),
+            Field::new("contract_version", DataType::Utf8, false),
+            Field::new("run_id", DataType::Utf8, false),
+            Field::new("row_id", DataType::UInt64, false),
+            Field::new("position_key", DataType::Utf8, false),
+            Field::new("ply", DataType::UInt16, false),
+            Field::new("side_to_move", DataType::UInt8, false),
+            Field::new(
+                "bitboards",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt16, false)), 8),
+                false,
+            ),
+            Field::new("qfen", DataType::Utf8, true),
+            Field::new("legal_action_mask", DataType::UInt64, false),
+            Field::new("engine_kind", DataType::Utf8, false),
+            Field::new("engine_version", DataType::Utf8, false),
+            Field::new("elapsed_ms", DataType::UInt32, false),
+            Field::new(
+                "policy_visits",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt32, false)), 64),
+                false,
+            ),
+            Field::new("value", DataType::Float64, false),
+            Field::new("value_source", DataType::Utf8, false),
+            Field::new("source_confidence", DataType::Float64, false),
+        ],
+        contract_arrow_metadata(OBSERVATION_SCHEMA, OBSERVATION_CONTRACT_VERSION),
+    ))
+}
+
+#[cfg(feature = "arrow-parquet")]
+fn game_result_parquet_schema() -> Arc<arrow_schema::Schema> {
+    use arrow_schema::{DataType, Field, Schema};
+
+    Arc::new(Schema::new_with_metadata(
+        vec![
+            Field::new("schema", DataType::Utf8, false),
+            Field::new("contract_version", DataType::Utf8, false),
+            Field::new("game_id", DataType::Utf8, false),
+            Field::new("started_at", DataType::Utf8, false),
+            Field::new("p0_engine_kind", DataType::Utf8, false),
+            Field::new("p0_engine_version", DataType::Utf8, false),
+            Field::new("p1_engine_kind", DataType::Utf8, false),
+            Field::new("p1_engine_version", DataType::Utf8, false),
+            Field::new("initial_position_key", DataType::Utf8, false),
+            Field::new("winner", DataType::UInt8, false),
+            Field::new("plies", DataType::UInt16, false),
+            Field::new("terminal_reason", DataType::Utf8, false),
+            Field::new(
+                "move_action_indices",
+                DataType::List(Arc::new(Field::new("item", DataType::UInt8, false))),
+                false,
+            ),
+            Field::new("run_id", DataType::Utf8, true),
+        ],
+        contract_arrow_metadata(GAME_RESULT_SCHEMA, GAME_RESULT_CONTRACT_VERSION),
+    ))
+}
+
+#[cfg(feature = "arrow-parquet")]
+fn contract_arrow_metadata(contract_schema: &str, version: &str) -> HashMap<String, String> {
+    HashMap::from([
+        ("physical_schema".to_string(), contract_schema.to_string()),
+        ("logical_schema".to_string(), contract_schema.to_string()),
+        ("logical_contract".to_string(), contract_schema.to_string()),
+        ("contracts_release".to_string(), version.to_string()),
+        ("contract_version".to_string(), version.to_string()),
+    ])
+}
+
+#[cfg(feature = "arrow-parquet")]
 fn selfplay_arrow_parquet_metadata() -> Vec<parquet::file::metadata::KeyValue> {
     vec![
         parquet::file::metadata::KeyValue {
@@ -1083,6 +1597,35 @@ fn selfplay_arrow_parquet_metadata() -> Vec<parquet::file::metadata::KeyValue> {
         parquet::file::metadata::KeyValue {
             key: "contract_version".to_string(),
             value: Some(SELFPLAY_CONTRACT_VERSION.to_string()),
+        },
+    ]
+}
+
+#[cfg(feature = "arrow-parquet")]
+fn contract_parquet_metadata(
+    contract_schema: &str,
+    version: &str,
+) -> Vec<parquet::file::metadata::KeyValue> {
+    vec![
+        parquet::file::metadata::KeyValue {
+            key: "physical_schema".to_string(),
+            value: Some(contract_schema.to_string()),
+        },
+        parquet::file::metadata::KeyValue {
+            key: "logical_schema".to_string(),
+            value: Some(contract_schema.to_string()),
+        },
+        parquet::file::metadata::KeyValue {
+            key: "logical_contract".to_string(),
+            value: Some(contract_schema.to_string()),
+        },
+        parquet::file::metadata::KeyValue {
+            key: "contracts_release".to_string(),
+            value: Some(version.to_string()),
+        },
+        parquet::file::metadata::KeyValue {
+            key: "contract_version".to_string(),
+            value: Some(version.to_string()),
         },
     ]
 }
@@ -1124,6 +1667,31 @@ fn validate_selfplay_arrow_parquet_metadata(
 }
 
 #[cfg(feature = "arrow-parquet")]
+fn validate_contract_parquet_metadata(
+    metadata: Option<&Vec<parquet::file::metadata::KeyValue>>,
+    expected_schema: &str,
+    expected_version: &str,
+) -> Result<(), String> {
+    let metadata = metadata.ok_or("parquet metadata is required")?;
+    let metadata = metadata
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .value
+                .as_ref()
+                .map(|value| (entry.key.as_str(), value.as_str()))
+        })
+        .collect::<HashMap<_, _>>();
+
+    validate_metadata_value_with_alias(&metadata, "physical_schema", None, expected_schema)?;
+    validate_metadata_value_with_alias(&metadata, "logical_schema", None, expected_schema)?;
+    validate_metadata_value_with_alias(&metadata, "logical_contract", None, expected_schema)?;
+    validate_metadata_value_with_alias(&metadata, "contracts_release", None, expected_version)?;
+    validate_metadata_value_with_alias(&metadata, "contract_version", None, expected_version)?;
+    Ok(())
+}
+
+#[cfg(feature = "arrow-parquet")]
 fn validate_metadata_value_with_alias(
     metadata: &HashMap<&str, &str>,
     key: &str,
@@ -1154,6 +1722,24 @@ fn validate_selfplay_arrow_schema(schema: &arrow_schema::Schema) -> Result<(), S
     let expected = selfplay_arrow_parquet_schema();
     if schema.fields() != expected.fields() {
         return Err("parquet arrow schema does not match arrow-parquet-selfplay.v1".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "arrow-parquet")]
+fn validate_observation_arrow_schema(schema: &arrow_schema::Schema) -> Result<(), String> {
+    let expected = observation_parquet_schema();
+    if schema.fields() != expected.fields() {
+        return Err("parquet arrow schema does not match observation.v1".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "arrow-parquet")]
+fn validate_game_result_arrow_schema(schema: &arrow_schema::Schema) -> Result<(), String> {
+    let expected = game_result_parquet_schema();
+    if schema.fields() != expected.fields() {
+        return Err("parquet arrow schema does not match game-result.v1".to_string());
     }
     Ok(())
 }
@@ -1195,6 +1781,15 @@ fn u16_column<'a>(
 }
 
 #[cfg(feature = "arrow-parquet")]
+fn u32_column<'a>(
+    batch: &'a arrow_array::RecordBatch,
+    index: usize,
+    field: &str,
+) -> Result<&'a arrow_array::UInt32Array, String> {
+    downcast_non_null_column(batch, index, field)
+}
+
+#[cfg(feature = "arrow-parquet")]
 fn u8_column<'a>(
     batch: &'a arrow_array::RecordBatch,
     index: usize,
@@ -1204,11 +1799,29 @@ fn u8_column<'a>(
 }
 
 #[cfg(feature = "arrow-parquet")]
+fn f64_column<'a>(
+    batch: &'a arrow_array::RecordBatch,
+    index: usize,
+    field: &str,
+) -> Result<&'a arrow_array::Float64Array, String> {
+    downcast_non_null_column(batch, index, field)
+}
+
+#[cfg(feature = "arrow-parquet")]
 fn i8_column<'a>(
     batch: &'a arrow_array::RecordBatch,
     index: usize,
     field: &str,
 ) -> Result<&'a arrow_array::Int8Array, String> {
+    downcast_non_null_column(batch, index, field)
+}
+
+#[cfg(feature = "arrow-parquet")]
+fn list_column<'a>(
+    batch: &'a arrow_array::RecordBatch,
+    index: usize,
+    field: &str,
+) -> Result<&'a arrow_array::ListArray, String> {
     downcast_non_null_column(batch, index, field)
 }
 
@@ -1306,6 +1919,39 @@ fn policy_visits_u32_at(
         *visits = values.value(index);
     }
     Ok(policy)
+}
+
+#[cfg(feature = "arrow-parquet")]
+fn action_indices_u8_at(
+    list: &arrow_array::ListArray,
+    row_index: usize,
+    field: &str,
+) -> Result<Vec<u8>, String> {
+    use arrow_array::Array;
+
+    if list.is_null(row_index) {
+        return Err(format!("{field} must not contain nulls"));
+    }
+    let values = list.value(row_index);
+    let values = values
+        .as_any()
+        .downcast_ref::<arrow_array::UInt8Array>()
+        .ok_or_else(|| format!("{field} child values have unexpected arrow type"))?;
+    Ok((0..values.len()).map(|index| values.value(index)).collect())
+}
+
+#[cfg(feature = "arrow-parquet")]
+fn observation_policy_visits_u32(policy_visits: &[u64]) -> Result<Vec<u32>, String> {
+    if policy_visits.len() != 64 {
+        return Err("policy_visits must contain exactly 64 unsigned integers".to_string());
+    }
+    policy_visits
+        .iter()
+        .map(|visits| {
+            u32::try_from(*visits)
+                .map_err(|_| "policy_visits entries must fit in uint32".to_string())
+        })
+        .collect()
 }
 
 fn validate_bitboard_state(bitboards: &Bitboard) -> Result<u8, String> {
@@ -1616,6 +2262,7 @@ mod tests {
         assert_eq!(parsed.side_to_move, 0);
         assert_eq!(parsed.policy_visits[18], 1);
         assert_eq!(parsed.legal_action_mask, u64::MAX);
+        assert_eq!(parsed.elapsed_ms, 250);
     }
 
     #[test]
@@ -1742,10 +2389,183 @@ mod tests {
         let parsed = parse_game_result_row(&projected).unwrap();
 
         assert_eq!(parsed.game_id, "run-00000002");
+        assert_eq!(parsed.started_at, "2026-07-14T00:00:00+0200");
+        assert_eq!(parsed.p0_engine_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(parsed.p1_engine_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(parsed.winner, 1);
         assert_eq!(parsed.plies, 3);
         assert_eq!(parsed.move_action_indices, vec![0, 17, 2]);
         assert_eq!(parsed.run_id.as_deref(), Some("run"));
+    }
+
+    #[cfg(feature = "arrow-parquet")]
+    #[test]
+    fn observation_parquet_round_trips_contract_surface() {
+        let positions = position_lookup(&dataset()).unwrap();
+        let projected = observation_v1_row(
+            3,
+            "run",
+            &json!({
+                "position_id": "p0000",
+                "engine": "minimax",
+                "move": "0:1:2",
+                "wall_time_s": 0.25,
+                "exact": true,
+                "seed": null,
+                "nodes": 10,
+                "iterations": null,
+                "depth_reached": 4,
+                "score": 1.0
+            }),
+            &positions["p0000"],
+        )
+        .unwrap();
+        let rows = vec![parse_observation_row(&projected).unwrap()];
+        let path = temp_contract_parquet_path("observation-roundtrip");
+
+        write_observations_parquet(&path, &rows).unwrap();
+        let round_tripped = read_observations_parquet(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(round_tripped, rows);
+        assert_eq!(round_tripped[0].elapsed_ms, 250);
+    }
+
+    #[cfg(feature = "arrow-parquet")]
+    #[test]
+    fn game_result_parquet_round_trips_contract_surface() {
+        let positions = position_lookup(&dataset()).unwrap();
+        let projected = game_result_v1_row(
+            4,
+            "run",
+            "2026-07-14T00:00:00+0200",
+            &json!({
+                "position_id": "p0000",
+                "mover": "mcts",
+                "responder": "minimax",
+                "winner": "minimax",
+                "plies": 3,
+                "seed": 7,
+                "move_action_indices": [0, 17, 2]
+            }),
+            &positions["p0000"],
+        )
+        .unwrap();
+        let rows = vec![parse_game_result_row(&projected).unwrap()];
+        let path = temp_contract_parquet_path("game-result-roundtrip");
+
+        write_game_results_parquet(&path, &rows).unwrap();
+        let round_tripped = read_game_results_parquet(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(round_tripped, rows);
+        assert_eq!(round_tripped[0].started_at, "2026-07-14T00:00:00+0200");
+    }
+
+    #[cfg(feature = "arrow-parquet")]
+    #[test]
+    fn observation_parquet_reader_rejects_drifted_metadata() {
+        let path = temp_contract_parquet_path("observation-bad-metadata");
+        let row = parse_observation_row(&json!({
+            "schema": OBSERVATION_SCHEMA,
+            "contract_version": OBSERVATION_CONTRACT_VERSION,
+            "run_id": "run",
+            "row_id": 0,
+            "position_key": canonical_key_hex(&State::default()),
+            "ply": 0,
+            "side_to_move": 0,
+            "bitboards": Bitboard::EMPTY.planes,
+            "qfen": "..../..../..../....",
+            "legal_action_mask": u64::MAX,
+            "engine_kind": "minimax",
+            "engine_version": "test",
+            "elapsed_ms": 0,
+            "policy_visits": [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "value": 0.0,
+            "value_source": "heuristic",
+            "source_confidence": 0.5
+        }))
+        .unwrap();
+        write_test_observation_parquet(&path, &[row], "observation.v2", 64).unwrap();
+
+        let error = read_observations_parquet(&path).expect_err("metadata drift must fail");
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            error.contains("parquet metadata")
+                && error.contains("must be observation.v1")
+                && error.contains("observation.v2"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(feature = "arrow-parquet")]
+    #[test]
+    fn observation_parquet_reader_rejects_dense_policy_shape_drift() {
+        let path = temp_contract_parquet_path("observation-bad-policy-shape");
+        let row = parse_observation_row(&json!({
+            "schema": OBSERVATION_SCHEMA,
+            "contract_version": OBSERVATION_CONTRACT_VERSION,
+            "run_id": "run",
+            "row_id": 0,
+            "position_key": canonical_key_hex(&State::default()),
+            "ply": 0,
+            "side_to_move": 0,
+            "bitboards": Bitboard::EMPTY.planes,
+            "qfen": "..../..../..../....",
+            "legal_action_mask": u64::MAX,
+            "engine_kind": "minimax",
+            "engine_version": "test",
+            "elapsed_ms": 0,
+            "policy_visits": [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "value": 0.0,
+            "value_source": "heuristic",
+            "source_confidence": 0.5
+        }))
+        .unwrap();
+        write_test_observation_parquet(&path, &[row], OBSERVATION_SCHEMA, 63).unwrap();
+
+        let error = read_observations_parquet(&path).expect_err("shape drift must fail");
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            error.contains("schema") || error.contains("policy_visits"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(feature = "arrow-parquet")]
+    #[test]
+    fn game_result_parquet_reader_rejects_drifted_metadata() {
+        let path = temp_contract_parquet_path("game-result-bad-metadata");
+        let row = parse_game_result_row(&json!({
+            "schema": GAME_RESULT_SCHEMA,
+            "contract_version": GAME_RESULT_CONTRACT_VERSION,
+            "game_id": "game",
+            "started_at": "2026-07-14T00:00:00+0200",
+            "p0_engine_kind": "mcts",
+            "p0_engine_version": "test",
+            "p1_engine_kind": "minimax",
+            "p1_engine_version": "test",
+            "initial_position_key": "key",
+            "winner": 0,
+            "plies": 2,
+            "terminal_reason": "win_condition_or_no_legal_moves",
+            "move_action_indices": [0, 17],
+            "run_id": null
+        }))
+        .unwrap();
+        write_test_game_result_parquet(&path, &[row], "game-result.v2").unwrap();
+
+        let error = read_game_results_parquet(&path).expect_err("metadata drift must fail");
+        std::fs::remove_file(&path).ok();
+
+        assert!(
+            error.contains("parquet metadata")
+                && error.contains("must be game-result.v1")
+                && error.contains("game-result.v2"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -1999,6 +2819,262 @@ mod tests {
             "quantik-selfplay-{label}-{}.parquet",
             std::process::id()
         ))
+    }
+
+    #[cfg(feature = "arrow-parquet")]
+    fn temp_contract_parquet_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "quantik-contract-{label}-{}.parquet",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(feature = "arrow-parquet")]
+    fn write_test_observation_parquet(
+        path: &std::path::Path,
+        rows: &[ObservationRow],
+        metadata_schema: &str,
+        policy_len: i32,
+    ) -> Result<(), String> {
+        use arrow_array::{
+            ArrayRef, FixedSizeListArray, Float64Array, RecordBatch, StringArray, UInt16Array,
+            UInt32Array, UInt64Array, UInt8Array,
+        };
+        use arrow_schema::{DataType, Field, Schema};
+        use parquet::arrow::arrow_writer::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("schema", DataType::Utf8, false),
+            Field::new("contract_version", DataType::Utf8, false),
+            Field::new("run_id", DataType::Utf8, false),
+            Field::new("row_id", DataType::UInt64, false),
+            Field::new("position_key", DataType::Utf8, false),
+            Field::new("ply", DataType::UInt16, false),
+            Field::new("side_to_move", DataType::UInt8, false),
+            Field::new(
+                "bitboards",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt16, false)), 8),
+                false,
+            ),
+            Field::new("qfen", DataType::Utf8, true),
+            Field::new("legal_action_mask", DataType::UInt64, false),
+            Field::new("engine_kind", DataType::Utf8, false),
+            Field::new("engine_version", DataType::Utf8, false),
+            Field::new("elapsed_ms", DataType::UInt32, false),
+            Field::new(
+                "policy_visits",
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::UInt32, false)),
+                    policy_len,
+                ),
+                false,
+            ),
+            Field::new("value", DataType::Float64, false),
+            Field::new("value_source", DataType::Utf8, false),
+            Field::new("source_confidence", DataType::Float64, false),
+        ]));
+        let mut physical_schema = Vec::with_capacity(rows.len());
+        let mut contract_version = Vec::with_capacity(rows.len());
+        let mut run_id = Vec::with_capacity(rows.len());
+        let mut row_id = Vec::with_capacity(rows.len());
+        let mut position_key = Vec::with_capacity(rows.len());
+        let mut ply = Vec::with_capacity(rows.len());
+        let mut side_to_move = Vec::with_capacity(rows.len());
+        let mut bitboards = Vec::with_capacity(rows.len() * 8);
+        let mut qfen = Vec::with_capacity(rows.len());
+        let mut legal_action_mask = Vec::with_capacity(rows.len());
+        let mut engine_kind = Vec::with_capacity(rows.len());
+        let mut engine_version = Vec::with_capacity(rows.len());
+        let mut elapsed_ms = Vec::with_capacity(rows.len());
+        let mut policy_visits = Vec::with_capacity(rows.len() * policy_len as usize);
+        let mut value = Vec::with_capacity(rows.len());
+        let mut value_source = Vec::with_capacity(rows.len());
+        let mut source_confidence = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            physical_schema.push(OBSERVATION_SCHEMA.to_string());
+            contract_version.push(OBSERVATION_CONTRACT_VERSION.to_string());
+            run_id.push(row.run_id.clone());
+            row_id.push(row.row_id);
+            position_key.push(row.position_key.clone());
+            ply.push(row.ply as u16);
+            side_to_move.push(row.side_to_move);
+            bitboards.extend(row.bitboards.planes);
+            qfen.push(row.qfen.clone());
+            legal_action_mask.push(row.legal_action_mask);
+            engine_kind.push(row.engine_kind.clone());
+            engine_version.push(row.engine_version.clone());
+            elapsed_ms.push(row.elapsed_ms);
+            for index in 0..policy_len as usize {
+                policy_visits.push(row.policy_visits.get(index).copied().unwrap_or(0) as u32);
+            }
+            value.push(row.value);
+            value_source.push(row.value_source.clone());
+            source_confidence.push(row.source_confidence);
+        }
+
+        let bitboards = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::UInt16, false)),
+            8,
+            Arc::new(UInt16Array::from(bitboards)),
+            None,
+        )
+        .map_err(|e| format!("build bitboards: {e}"))?;
+        let policy_visits = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::UInt32, false)),
+            policy_len,
+            Arc::new(UInt32Array::from(policy_visits)),
+            None,
+        )
+        .map_err(|e| format!("build policy_visits: {e}"))?;
+        let qfen_values = qfen
+            .iter()
+            .map(|value| value.as_deref())
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(physical_schema)) as ArrayRef,
+                Arc::new(StringArray::from(contract_version)) as ArrayRef,
+                Arc::new(StringArray::from(run_id)) as ArrayRef,
+                Arc::new(UInt64Array::from(row_id)) as ArrayRef,
+                Arc::new(StringArray::from(position_key)) as ArrayRef,
+                Arc::new(UInt16Array::from(ply)) as ArrayRef,
+                Arc::new(UInt8Array::from(side_to_move)) as ArrayRef,
+                Arc::new(bitboards) as ArrayRef,
+                Arc::new(StringArray::from(qfen_values)) as ArrayRef,
+                Arc::new(UInt64Array::from(legal_action_mask)) as ArrayRef,
+                Arc::new(StringArray::from(engine_kind)) as ArrayRef,
+                Arc::new(StringArray::from(engine_version)) as ArrayRef,
+                Arc::new(UInt32Array::from(elapsed_ms)) as ArrayRef,
+                Arc::new(policy_visits) as ArrayRef,
+                Arc::new(Float64Array::from(value)) as ArrayRef,
+                Arc::new(StringArray::from(value_source)) as ArrayRef,
+                Arc::new(Float64Array::from(source_confidence)) as ArrayRef,
+            ],
+        )
+        .map_err(|e| format!("build batch: {e}"))?;
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(contract_parquet_metadata(
+                metadata_schema,
+                OBSERVATION_CONTRACT_VERSION,
+            )))
+            .build();
+        let file = std::fs::File::create(path).map_err(|e| format!("create test parquet: {e}"))?;
+        let mut writer =
+            ArrowWriter::try_new(file, schema, Some(props)).map_err(|e| e.to_string())?;
+        writer.write(&batch).map_err(|e| e.to_string())?;
+        writer.close().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    #[cfg(feature = "arrow-parquet")]
+    fn write_test_game_result_parquet(
+        path: &std::path::Path,
+        rows: &[GameResultRow],
+        metadata_schema: &str,
+    ) -> Result<(), String> {
+        use arrow_array::builder::{ListBuilder, UInt8Builder};
+        use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt16Array, UInt8Array};
+        use arrow_schema::{DataType, Field, Schema};
+        use parquet::arrow::arrow_writer::ArrowWriter;
+        use parquet::file::properties::WriterProperties;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("schema", DataType::Utf8, false),
+            Field::new("contract_version", DataType::Utf8, false),
+            Field::new("game_id", DataType::Utf8, false),
+            Field::new("started_at", DataType::Utf8, false),
+            Field::new("p0_engine_kind", DataType::Utf8, false),
+            Field::new("p0_engine_version", DataType::Utf8, false),
+            Field::new("p1_engine_kind", DataType::Utf8, false),
+            Field::new("p1_engine_version", DataType::Utf8, false),
+            Field::new("initial_position_key", DataType::Utf8, false),
+            Field::new("winner", DataType::UInt8, false),
+            Field::new("plies", DataType::UInt16, false),
+            Field::new("terminal_reason", DataType::Utf8, false),
+            Field::new(
+                "move_action_indices",
+                DataType::List(Arc::new(Field::new("item", DataType::UInt8, false))),
+                false,
+            ),
+            Field::new("run_id", DataType::Utf8, true),
+        ]));
+        let mut physical_schema = Vec::with_capacity(rows.len());
+        let mut contract_version = Vec::with_capacity(rows.len());
+        let mut game_id = Vec::with_capacity(rows.len());
+        let mut started_at = Vec::with_capacity(rows.len());
+        let mut p0_engine_kind = Vec::with_capacity(rows.len());
+        let mut p0_engine_version = Vec::with_capacity(rows.len());
+        let mut p1_engine_kind = Vec::with_capacity(rows.len());
+        let mut p1_engine_version = Vec::with_capacity(rows.len());
+        let mut initial_position_key = Vec::with_capacity(rows.len());
+        let mut winner = Vec::with_capacity(rows.len());
+        let mut plies = Vec::with_capacity(rows.len());
+        let mut terminal_reason = Vec::with_capacity(rows.len());
+        let mut move_action_indices = ListBuilder::new(UInt8Builder::new())
+            .with_field(Arc::new(Field::new("item", DataType::UInt8, false)));
+        let mut run_id = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            physical_schema.push(GAME_RESULT_SCHEMA.to_string());
+            contract_version.push(GAME_RESULT_CONTRACT_VERSION.to_string());
+            game_id.push(row.game_id.clone());
+            started_at.push(row.started_at.clone());
+            p0_engine_kind.push(row.p0_engine_kind.clone());
+            p0_engine_version.push(row.p0_engine_version.clone());
+            p1_engine_kind.push(row.p1_engine_kind.clone());
+            p1_engine_version.push(row.p1_engine_version.clone());
+            initial_position_key.push(row.initial_position_key.clone());
+            winner.push(row.winner);
+            plies.push(row.plies as u16);
+            terminal_reason.push(row.terminal_reason.clone());
+            for action in &row.move_action_indices {
+                move_action_indices.values().append_value(*action);
+            }
+            move_action_indices.append(true);
+            run_id.push(row.run_id.clone());
+        }
+
+        let run_id_values = run_id
+            .iter()
+            .map(|value| value.as_deref())
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(physical_schema)) as ArrayRef,
+                Arc::new(StringArray::from(contract_version)) as ArrayRef,
+                Arc::new(StringArray::from(game_id)) as ArrayRef,
+                Arc::new(StringArray::from(started_at)) as ArrayRef,
+                Arc::new(StringArray::from(p0_engine_kind)) as ArrayRef,
+                Arc::new(StringArray::from(p0_engine_version)) as ArrayRef,
+                Arc::new(StringArray::from(p1_engine_kind)) as ArrayRef,
+                Arc::new(StringArray::from(p1_engine_version)) as ArrayRef,
+                Arc::new(StringArray::from(initial_position_key)) as ArrayRef,
+                Arc::new(UInt8Array::from(winner)) as ArrayRef,
+                Arc::new(UInt16Array::from(plies)) as ArrayRef,
+                Arc::new(StringArray::from(terminal_reason)) as ArrayRef,
+                Arc::new(move_action_indices.finish()) as ArrayRef,
+                Arc::new(StringArray::from(run_id_values)) as ArrayRef,
+            ],
+        )
+        .map_err(|e| format!("build batch: {e}"))?;
+        let props = WriterProperties::builder()
+            .set_key_value_metadata(Some(contract_parquet_metadata(
+                metadata_schema,
+                GAME_RESULT_CONTRACT_VERSION,
+            )))
+            .build();
+        let file = std::fs::File::create(path).map_err(|e| format!("create test parquet: {e}"))?;
+        let mut writer =
+            ArrowWriter::try_new(file, schema, Some(props)).map_err(|e| e.to_string())?;
+        writer.write(&batch).map_err(|e| e.to_string())?;
+        writer.close().map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     #[cfg(feature = "arrow-parquet")]
