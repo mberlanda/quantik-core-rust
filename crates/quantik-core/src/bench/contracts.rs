@@ -292,6 +292,15 @@ pub fn selfplay_arrow_parquet_record(row: &SelfPlayRow) -> Result<Value, String>
     let ply = u16::try_from(row.ply)
         .map_err(|_| "ply must fit in uint16 for arrow-parquet-selfplay.v1".to_string())?;
     let state = State::from_qfen(&row.qfen)?;
+    if row.side_to_move > 1 {
+        return Err("side_to_move must be 0 or 1".to_string());
+    }
+    let expected_side =
+        current_player(&state.bb).ok_or_else(|| "side_to_move does not match qfen".to_string())?;
+    if expected_side != row.side_to_move {
+        return Err("side_to_move does not match qfen".to_string());
+    }
+    validate_selfplay_policy_is_legal(&state.bb, &row.policy)?;
     let value = if row.value == 1.0 {
         1i8
     } else if row.value == -1.0 {
