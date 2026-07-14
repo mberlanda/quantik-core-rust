@@ -16,7 +16,7 @@ use std::io::Write;
 use std::path::Path;
 
 pub const CONTRACT_VERSION: &str = "1.0.0";
-pub const MODEL_CHECKPOINT_CONTRACT_VERSION: &str = "1.1.0";
+pub const MODEL_CHECKPOINT_CONTRACT_VERSION: &str = "1.0.0";
 pub const OPENING_BOOK_SCHEMA: &str = "opening-book.v1";
 pub const OBSERVATION_SCHEMA: &str = "observation.v1";
 pub const GAME_RESULT_SCHEMA: &str = "game-result.v1";
@@ -639,7 +639,7 @@ mod tests {
             ("wrong schema", json!({"schema": "observation.v1"})),
             (
                 "wrong contract version",
-                json!({"contract_version": "1.0.0"}),
+                json!({"contract_version": "2.0.0"}),
             ),
             ("empty model id", json!({"model_id": ""})),
             ("empty input contracts", json!({"input_contracts": []})),
@@ -714,7 +714,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(manifest.schema, MODEL_CHECKPOINT_SCHEMA);
-        assert_eq!(manifest.contract_version, "1.1.0");
+        assert_eq!(manifest.contract_version, "1.0.0");
         assert_eq!(manifest.weights_format, "safetensors");
     }
 }
