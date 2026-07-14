@@ -1,0 +1,26 @@
+{
+  "schema": "model-checkpoint.v1",
+  "contract_version": "1.1.0",
+  "model_id": "quantik-policy-value-fixture",
+  "model_family": "policy-value",
+  "created_at": "2026-07-14T12:00:00Z",
+  "input_contracts": [
+    "observation.v1"
+  ],
+  "output_contract": "policy-value.v1",
+  "weights_format": "safetensors",
+  "weights_hash": "sha256:0123456789abcdef",
+  "size_bytes": 1024,
+  "training_data_manifest": "fixtures/training-data-manifest.json",
+  "calibration_report": "fixtures/calibration-report.json",
+  "feature_hash": "sha256:abcdef0123456789",
+  "quantization": "float32",
+  "parameter_count": 123456,
+  "architecture": "tiny-transformer",
+  "legal_action_mask_required": true,
+  "recommended_engine_order": [
+    "rust",
+    "python"
+  ],
+  "notes": "Small metadata-only fixture for model-checkpoint.v1 parser tests."
+}
