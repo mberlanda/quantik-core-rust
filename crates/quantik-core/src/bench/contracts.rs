@@ -289,17 +289,8 @@ pub fn selfplay_dense_policy_visits(policy: &[SelfPlayPolicyVisit]) -> Result<[u
 }
 
 pub fn selfplay_arrow_parquet_record(row: &SelfPlayRow) -> Result<Value, String> {
-    if row.ply > u16::MAX as u64 {
-        return Err("ply must fit in uint16 for arrow-parquet-selfplay.v1".to_string());
-    }
-    selfplay_v1_row(
-        row.game_id,
-        row.ply,
-        &row.qfen,
-        row.side_to_move,
-        &row.policy,
-        row.value,
-    )?;
+    let ply = u16::try_from(row.ply)
+        .map_err(|_| "ply must fit in uint16 for arrow-parquet-selfplay.v1".to_string())?;
     let state = State::from_qfen(&row.qfen)?;
     let value = if row.value == 1.0 {
         1i8
@@ -314,7 +305,7 @@ pub fn selfplay_arrow_parquet_record(row: &SelfPlayRow) -> Result<Value, String>
         "logical_schema": SELFPLAY_SCHEMA,
         "contract_version": SELFPLAY_CONTRACT_VERSION,
         "game_id": row.game_id,
-        "ply": row.ply,
+        "ply": ply,
         "side_to_move": row.side_to_move,
         "bitboards": state.bb.planes,
         "policy_visits": policy_visits,
@@ -1301,6 +1292,7 @@ mod tests {
             physical["contract_version"],
             json!(SELFPLAY_CONTRACT_VERSION)
         );
+        assert_eq!(physical["ply"], json!(1u16));
         assert_eq!(physical["bitboards"], json!([1, 0, 0, 0, 0, 0, 0, 0]));
         assert_eq!(physical["policy_visits"][10], json!(2));
         assert_eq!(physical["policy_visits"][17], json!(6));
