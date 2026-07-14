@@ -12,10 +12,17 @@ keywords = ["quantik", "board-games", "mcts", "bitboards", "game-ai"]
 categories = ["game-development", "algorithms"]
 authors = ["Mauro Berlanda <mauro.berlanda@gmail.com>"]
 
+[features]
+default = []
+arrow-parquet = ["dep:arrow-array", "dep:arrow-schema", "dep:parquet"]
+
 [dependencies]
+arrow-array = { version = "59.1.0", optional = true }
+arrow-schema = { version = "59.1.0", optional = true }
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+parquet = { version = "59.1.0", default-features = false, features = ["arrow"], optional = true }
 rand = "0.8"
 rayon = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
