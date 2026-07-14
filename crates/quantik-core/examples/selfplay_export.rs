@@ -7,6 +7,8 @@
 //!
 //! Row schema (one per line, compact canonical JSON):
 //! {
+//!   "schema": "selfplay.v1",
+//!   "contract_version": "1.1.0",
 //!   "game_id": u64,
 //!   "ply": u32,
 //!   "qfen": string,
@@ -21,12 +23,12 @@
 //!     --out benchmarks/results/selfplay.jsonl
 
 use quantik_core::bench::canonical::canonical_json;
+use quantik_core::bench::contracts::{selfplay_v1_row, SelfPlayPolicyVisit};
 use quantik_core::bitboard::Bitboard;
 use quantik_core::game::{check_winner, current_player, has_winning_line, WinStatus};
 use quantik_core::mcts::{MCTSConfig, MCTSEngine};
 use quantik_core::moves::{apply_move, generate_legal_moves};
 use quantik_core::state::State;
-use serde_json::json;
 use std::io::Write;
 
 struct Args {
@@ -63,7 +65,7 @@ struct PendingRow {
     ply: u32,
     qfen: String,
     side_to_move: u8,
-    policy: Vec<(u8, u8, u32)>, // (shape, position, visits)
+    policy: Vec<SelfPlayPolicyVisit>,
 }
 
 /// Play one self-play game to completion, returning one pending row per
@@ -110,10 +112,15 @@ fn play_game(seed: u64, iterations: u32) -> (Vec<PendingRow>, WinStatus) {
             ..Default::default()
         });
         let (best_move, _) = engine.search(&bb).expect("legal moves exist");
-        let policy: Vec<(u8, u8, u32)> = engine
+        let policy: Vec<SelfPlayPolicyVisit> = engine
             .root_move_visits()
             .into_iter()
-            .map(|(mv, visits)| (mv.shape, mv.position, visits))
+            .filter(|(_, visits)| *visits > 0)
+            .map(|(mv, visits)| SelfPlayPolicyVisit {
+                shape: mv.shape,
+                position: mv.position,
+                visits,
+            })
             .collect();
 
         rows.push(PendingRow {
@@ -158,21 +165,15 @@ fn main() {
                 // exhaustive catch-all for the match to compile.
                 _ => unreachable!("side_to_move is always 0 or 1, winner is always decisive"),
             };
-            let policy_json: Vec<_> = row
-                .policy
-                .iter()
-                .map(|(shape, position, visits)| {
-                    json!({"shape": shape, "position": position, "visits": visits})
-                })
-                .collect();
-            let record = json!({
-                "game_id": game_id,
-                "ply": row.ply,
-                "qfen": row.qfen,
-                "side_to_move": row.side_to_move,
-                "policy": policy_json,
-                "value": value,
-            });
+            let record = selfplay_v1_row(
+                game_id as u64,
+                row.ply as u64,
+                &row.qfen,
+                row.side_to_move,
+                &row.policy,
+                value,
+            )
+            .expect("self-play row must satisfy selfplay.v1");
             writeln!(file, "{}", canonical_json(&record)).expect("write row");
         }
 
