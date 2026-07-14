@@ -36,6 +36,32 @@ scripts/generate_opening_book.sh search \
   --db benchmarks/results/depth6-book.sqlite
 ```
 
+Inspect an existing `bench_bfs` SQLite book:
+
+```sh
+scripts/inspect_opening_book.sh stats \
+  --db benchmarks/results/depth6-book.sqlite \
+  --depth 7
+
+scripts/inspect_opening_book.sh frontier \
+  --db benchmarks/results/depth6-book.sqlite \
+  --depth 7 \
+  --limit 20
+
+scripts/inspect_opening_book.sh storage \
+  --db benchmarks/results/depth6-book.sqlite
+```
+
+To continue expanding non-terminal horizon rows, resume to a larger target
+depth:
+
+```sh
+scripts/generate_opening_book.sh search \
+  --depth 7 \
+  --db benchmarks/results/depth6-book.sqlite \
+  --resume
+```
+
 ## Observations
 
 Generate observations for selected engines with checkpointing:
