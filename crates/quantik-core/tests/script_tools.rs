@@ -42,6 +42,7 @@ fn benchmark_scripts_have_help() {
         "generate_observations.sh",
         "generate_h2h_stats.sh",
         "export_contract_rows.sh",
+        "inspect_opening_book.sh",
         "plan_runs.sh",
     ] {
         let (success, text) = run_script(script, &["--help"]);
@@ -73,6 +74,49 @@ fn dry_run_contract_export_renders_projection_commands() {
     assert!(
         text.contains("--dataset benchmarks/positions-v1.json"),
         "{text}"
+    );
+}
+
+#[test]
+fn opening_book_inspection_renders_stats_command() {
+    let (success, text) = run_script(
+        "inspect_opening_book.sh",
+        &[
+            "stats",
+            "--db",
+            "benchmarks/results/depth6-book.sqlite",
+            "--depth",
+            "7",
+            "--dry-run",
+        ],
+    );
+
+    assert!(success, "dry run failed:\n{text}");
+    assert!(text.contains("bench_bfs_inspect"), "{text}");
+    assert!(
+        text.contains("--db benchmarks/results/depth6-book.sqlite"),
+        "{text}"
+    );
+    assert!(text.contains("stats --target-depth 7"), "{text}");
+}
+
+#[test]
+fn opening_book_inspection_prints_resume_command() {
+    let (success, text) = run_script(
+        "inspect_opening_book.sh",
+        &[
+            "resume-command",
+            "--db",
+            "benchmarks/results/depth6-book.sqlite",
+            "--depth",
+            "7",
+        ],
+    );
+
+    assert!(success, "resume command failed:\n{text}");
+    assert_eq!(
+        text.trim(),
+        "scripts/generate_opening_book.sh search --depth 7 --db benchmarks/results/depth6-book.sqlite --resume"
     );
 }
 
