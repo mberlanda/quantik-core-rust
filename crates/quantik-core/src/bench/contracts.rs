@@ -18,6 +18,8 @@ use std::path::Path;
 
 pub const CONTRACT_VERSION: &str = "1.1.0";
 pub const MODEL_CHECKPOINT_CONTRACT_VERSION: &str = "1.1.0";
+pub const OBSERVATION_CONTRACT_VERSION: &str = "1.0.0";
+pub const GAME_RESULT_CONTRACT_VERSION: &str = "1.0.0";
 pub const OPENING_BOOK_SCHEMA: &str = "opening-book.v1";
 pub const OBSERVATION_SCHEMA: &str = "observation.v1";
 pub const GAME_RESULT_SCHEMA: &str = "game-result.v1";
@@ -202,10 +204,13 @@ pub fn parse_observation_row(value: &Value) -> Result<ObservationRow, String> {
     let object = value
         .as_object()
         .ok_or("observation row must be a JSON object")?;
-    validate_contract_shape(object, OBSERVATION_SCHEMA, CONTRACT_VERSION)?;
+    validate_contract_shape(object, OBSERVATION_SCHEMA, OBSERVATION_CONTRACT_VERSION)?;
 
     let row_id = required_u64(object, "row_id")?;
     let ply = required_u64(object, "ply")?;
+    if ply > u16::MAX as u64 {
+        return Err("ply must fit in uint16".to_string());
+    }
     let side_to_move = required_u8(object, "side_to_move")?;
     if side_to_move > 1 {
         return Err("side_to_move must be 0 or 1".to_string());
@@ -231,8 +236,9 @@ pub fn parse_observation_row(value: &Value) -> Result<ObservationRow, String> {
         return Err("legal_action_mask does not match bitboards".to_string());
     }
 
+    let _elapsed_ms = required_u32(object, "elapsed_ms")?;
     let policy_visits = required_u64_list(object, "policy_visits", 64)?;
-    if policy_visits.iter().sum::<u64>() == 0 {
+    if legal_mask != 0 && policy_visits.iter().sum::<u64>() == 0 {
         return Err("policy_visits must contain at least one visit".to_string());
     }
     for (index, visits) in policy_visits.iter().enumerate() {
@@ -268,13 +274,20 @@ pub fn parse_game_result_row(value: &Value) -> Result<GameResultRow, String> {
     let object = value
         .as_object()
         .ok_or("game-result row must be a JSON object")?;
-    validate_contract_shape(object, GAME_RESULT_SCHEMA, CONTRACT_VERSION)?;
+    validate_contract_shape(object, GAME_RESULT_SCHEMA, GAME_RESULT_CONTRACT_VERSION)?;
+
+    let _started_at = required_string(object, "started_at")?;
+    let _p0_engine_version = required_string(object, "p0_engine_version")?;
+    let _p1_engine_version = required_string(object, "p1_engine_version")?;
 
     let winner = required_u8(object, "winner")?;
     if winner > 1 {
         return Err("winner must be 0 or 1".to_string());
     }
     let plies = required_u64(object, "plies")?;
+    if plies > u16::MAX as u64 {
+        return Err("plies must fit in uint16".to_string());
+    }
     let move_action_indices = required_action_index_list(object, "move_action_indices")?;
     if plies != move_action_indices.len() as u64 {
         return Err("plies must match move_action_indices length".to_string());
@@ -388,6 +401,11 @@ fn required_u64(object: &serde_json::Map<String, Value>, field: &str) -> Result<
     value
         .as_u64()
         .ok_or_else(|| format!("{field} must be an unsigned integer"))
+}
+
+fn required_u32(object: &serde_json::Map<String, Value>, field: &str) -> Result<u32, String> {
+    let value = required_u64(object, field)?;
+    u32::try_from(value).map_err(|_| format!("{field} must fit in uint32"))
 }
 
 fn optional_u64(
@@ -621,7 +639,7 @@ pub fn observation_v1_row(
 
     Ok(json!({
         "schema": OBSERVATION_SCHEMA,
-        "contract_version": CONTRACT_VERSION,
+        "contract_version": OBSERVATION_CONTRACT_VERSION,
         "run_id": run_id,
         "row_id": row_id,
         "position_key": canonical_key_hex(&state),
@@ -681,7 +699,7 @@ pub fn game_result_v1_row(
 
     Ok(json!({
         "schema": GAME_RESULT_SCHEMA,
-        "contract_version": CONTRACT_VERSION,
+        "contract_version": GAME_RESULT_CONTRACT_VERSION,
         "game_id": format!("{run_id}-{row_id:08}"),
         "started_at": started_at,
         "p0_engine_kind": p0_engine,
@@ -806,7 +824,10 @@ mod tests {
         });
         let projected = observation_v1_row(0, "run", &row, &positions["p0000"]).unwrap();
         assert_eq!(projected["schema"], OBSERVATION_SCHEMA);
-        assert_eq!(projected["contract_version"], json!("1.1.0"));
+        assert_eq!(
+            projected["contract_version"],
+            json!(OBSERVATION_CONTRACT_VERSION)
+        );
         assert_eq!(projected["policy_visits"][18], json!(1));
         assert_eq!(projected["legal_action_mask"], json!(u64::MAX));
         assert_eq!(projected["value_source"], json!("exact"));
@@ -855,7 +876,7 @@ mod tests {
         });
         let valid = observation_v1_row(0, "run", &row, &positions["p0000"]).unwrap();
         let cases = [
-            ("bad version", json!({"contract_version": "1.0.0"})),
+            ("bad version", json!({"contract_version": "1.1.0"})),
             ("bad schema", json!({"schema": "game-result.v1"})),
             ("bad mask", json!({"legal_action_mask": 0})),
             ("bad confidence", json!({"source_confidence": 1.5})),
@@ -881,7 +902,7 @@ mod tests {
         policy_visits[0] = 1;
         let row = json!({
             "schema": OBSERVATION_SCHEMA,
-            "contract_version": CONTRACT_VERSION,
+            "contract_version": OBSERVATION_CONTRACT_VERSION,
             "run_id": "run",
             "row_id": 0,
             "position_key": "key",
@@ -925,7 +946,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(projected["schema"], GAME_RESULT_SCHEMA);
-        assert_eq!(projected["contract_version"], json!("1.1.0"));
+        assert_eq!(
+            projected["contract_version"],
+            json!(GAME_RESULT_CONTRACT_VERSION)
+        );
         assert_eq!(projected["p0_engine_kind"], json!("mcts"));
         assert_eq!(projected["p1_engine_kind"], json!("minimax"));
         assert_eq!(projected["winner"], json!(1));
@@ -986,7 +1010,7 @@ mod tests {
         )
         .unwrap();
         let cases = [
-            ("bad version", json!({"contract_version": "1.0.0"})),
+            ("bad version", json!({"contract_version": "1.1.0"})),
             ("bad schema", json!({"schema": "observation.v1"})),
             ("bad winner", json!({"winner": 2})),
             ("bad plies", json!({"plies": 4})),
