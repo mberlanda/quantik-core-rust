@@ -17,6 +17,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use super::contracts::CONTRACT_VERSION;
+
 pub const SCHEMA_VERSION: u64 = 1;
 pub const GENERATOR: &str = "benchmarks.dataset.generate/v1";
 
@@ -158,6 +160,7 @@ pub fn generate(requested: &BTreeMap<String, u32>, seed: u64) -> Result<Value, S
         .collect();
 
     Ok(json!({
+        "contract_version": CONTRACT_VERSION,
         "schema_version": SCHEMA_VERSION,
         "generator": GENERATOR,
         "seed": seed,

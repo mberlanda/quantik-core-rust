@@ -41,12 +41,39 @@ fn benchmark_scripts_have_help() {
         "generate_opening_book.sh",
         "generate_observations.sh",
         "generate_h2h_stats.sh",
+        "export_contract_rows.sh",
         "plan_runs.sh",
     ] {
         let (success, text) = run_script(script, &["--help"]);
         assert!(success, "{script} --help failed:\n{text}");
         assert!(text.contains("Usage:"), "{script} missing usage:\n{text}");
     }
+}
+
+#[test]
+fn dry_run_contract_export_renders_projection_commands() {
+    let (success, text) = run_script(
+        "export_contract_rows.sh",
+        &[
+            "--input",
+            "benchmarks/results/dev-ckpt",
+            "--dataset",
+            "benchmarks/positions-v1.json",
+            "--observations-output",
+            "benchmarks/results/observations-v1.jsonl",
+            "--games-output",
+            "benchmarks/results/games-v1.jsonl",
+            "--dry-run",
+        ],
+    );
+
+    assert!(success, "dry run failed:\n{text}");
+    assert!(text.contains("export-observations"), "{text}");
+    assert!(text.contains("export-games"), "{text}");
+    assert!(
+        text.contains("--dataset benchmarks/positions-v1.json"),
+        "{text}"
+    );
 }
 
 #[test]

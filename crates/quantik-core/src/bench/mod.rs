@@ -10,6 +10,7 @@ pub mod book_export;
 pub mod bundle;
 pub mod canonical;
 pub mod checkpoint;
+pub mod contracts;
 pub mod correctness;
 pub mod dataset;
 pub mod head_to_head;

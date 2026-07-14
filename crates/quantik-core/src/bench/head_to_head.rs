@@ -7,6 +7,7 @@
 //! player to move.
 
 use crate::bench::adapters::{select, EngineAdapter};
+use crate::bench::contracts::action_index;
 use crate::bench::metrics::wilson_ci;
 use crate::game::{current_player, has_winning_line};
 use crate::moves::{apply_move, generate_legal_moves};
@@ -16,13 +17,13 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
 
 /// Play from `bb`; `mover` is the side already to move.
-/// Returns `(winner adapter name, plies played)`.
+/// Returns `(winner adapter name, plies played, move action indices)`.
 pub fn play_game(
     mover: &dyn EngineAdapter,
     responder: &dyn EngineAdapter,
     bb: &crate::bitboard::Bitboard,
     seed: u64,
-) -> Result<(String, u32), String> {
+) -> Result<(String, u32, Vec<u8>), String> {
     let mut bb = *bb;
     let mut turn = current_player(&bb).ok_or("inconsistent position")?;
     let start_turn = turn;
@@ -34,14 +35,20 @@ pub fn play_game(
         }
     };
     let mut plies = 0u32;
+    let mut move_action_indices = Vec::new();
 
     loop {
         if has_winning_line(&bb) || generate_legal_moves(&bb).is_empty() {
             // The previous mover ended the game (line or block): the side
             // to move now has lost.
-            return Ok((engine_for(1 - turn).name().to_string(), plies));
+            return Ok((
+                engine_for(1 - turn).name().to_string(),
+                plies,
+                move_action_indices,
+            ));
         }
         let (mv, _) = select(engine_for(turn), &bb, "h2h", Some(seed))?;
+        move_action_indices.push(action_index(mv.shape, mv.position));
         bb = apply_move(&bb, &mv);
         turn ^= 1;
         plies += 1;
@@ -109,7 +116,8 @@ fn build_h2h_tasks<'a>(
 fn play_h2h_task(task: &H2hTask) -> Result<Value, String> {
     let bb = State::from_qfen(task.position["qfen"].as_str().unwrap_or_default())?.bb;
     let position_id = task.position["id"].as_str().unwrap_or_default();
-    let (winner, plies) = play_game(task.mover, task.responder, &bb, task.seed)?;
+    let (winner, plies, move_action_indices) =
+        play_game(task.mover, task.responder, &bb, task.seed)?;
     Ok(json!({
         "position_id": position_id,
         "phase": task.position["phase"],
@@ -117,6 +125,7 @@ fn play_h2h_task(task: &H2hTask) -> Result<Value, String> {
         "responder": task.responder.name(),
         "winner": winner,
         "plies": plies,
+        "move_action_indices": move_action_indices,
         "seed": task.seed,
     }))
 }
@@ -271,9 +280,10 @@ mod tests {
             time_limit_s: None,
         };
         let random = RandomAdapter;
-        let (winner, plies) = play_game(&minimax, &random, &bb, 0).unwrap();
+        let (winner, plies, moves) = play_game(&minimax, &random, &bb, 0).unwrap();
         assert_eq!(winner, "minimax");
         assert_eq!(plies, 1);
+        assert_eq!(moves.len(), 1);
     }
 
     #[test]
