@@ -16,10 +16,284 @@ use std::io::Write;
 use std::path::Path;
 
 pub const CONTRACT_VERSION: &str = "1.0.0";
+pub const MODEL_CHECKPOINT_CONTRACT_VERSION: &str = "1.1.0";
 pub const OPENING_BOOK_SCHEMA: &str = "opening-book.v1";
 pub const OBSERVATION_SCHEMA: &str = "observation.v1";
 pub const GAME_RESULT_SCHEMA: &str = "game-result.v1";
 pub const MODEL_CHECKPOINT_SCHEMA: &str = "model-checkpoint.v1";
+
+const SUPPORTED_MODEL_INPUT_CONTRACTS: &[&str] = &[
+    "qfen.v1",
+    "bitboard.v1",
+    "action-index.v1",
+    "selfplay.v1",
+    "tensor-board.v1",
+    "arrow-parquet-selfplay.v1",
+    OPENING_BOOK_SCHEMA,
+    "opening-book-summary.v1",
+    OBSERVATION_SCHEMA,
+    GAME_RESULT_SCHEMA,
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCheckpointManifest {
+    pub schema: String,
+    pub contract_version: String,
+    pub model_id: String,
+    pub model_family: String,
+    pub created_at: String,
+    pub input_contracts: Vec<String>,
+    pub output_contract: String,
+    pub weights_format: String,
+    pub weights_hash: String,
+    pub size_bytes: u64,
+    pub training_data_manifest: String,
+    pub calibration_report: String,
+    pub feature_hash: Option<String>,
+    pub quantization: Option<String>,
+    pub parameter_count: Option<u64>,
+    pub architecture: Option<String>,
+    pub legal_action_mask_required: Option<bool>,
+    pub recommended_engine_order: Option<Vec<String>>,
+    pub notes: Option<String>,
+}
+
+impl ModelCheckpointManifest {
+    pub fn from_json_str(text: &str) -> Result<Self, String> {
+        let value: Value =
+            serde_json::from_str(text).map_err(|e| format!("parse model checkpoint: {e}"))?;
+        Self::from_json_value(value)
+    }
+
+    pub fn from_json_value(value: Value) -> Result<Self, String> {
+        let object = value
+            .as_object()
+            .ok_or("model checkpoint manifest must be a JSON object")?;
+
+        let manifest = Self {
+            schema: required_string(object, "schema")?,
+            contract_version: required_string(object, "contract_version")?,
+            model_id: required_string(object, "model_id")?,
+            model_family: required_string(object, "model_family")?,
+            created_at: required_string(object, "created_at")?,
+            input_contracts: required_string_list(object, "input_contracts")?,
+            output_contract: required_string(object, "output_contract")?,
+            weights_format: required_string(object, "weights_format")?,
+            weights_hash: required_string(object, "weights_hash")?,
+            size_bytes: required_u64(object, "size_bytes")?,
+            training_data_manifest: required_string(object, "training_data_manifest")?,
+            calibration_report: required_string(object, "calibration_report")?,
+            feature_hash: optional_string(object, "feature_hash")?,
+            quantization: optional_string(object, "quantization")?,
+            parameter_count: optional_u64(object, "parameter_count")?,
+            architecture: optional_string(object, "architecture")?,
+            legal_action_mask_required: optional_bool(object, "legal_action_mask_required")?,
+            recommended_engine_order: optional_string_list(object, "recommended_engine_order")?,
+            notes: optional_string(object, "notes")?,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != MODEL_CHECKPOINT_SCHEMA {
+            return Err(format!(
+                "schema must be {MODEL_CHECKPOINT_SCHEMA}, got {}",
+                self.schema
+            ));
+        }
+        if self.contract_version != MODEL_CHECKPOINT_CONTRACT_VERSION {
+            return Err(format!(
+                "contract_version must be {MODEL_CHECKPOINT_CONTRACT_VERSION}, got {}",
+                self.contract_version
+            ));
+        }
+        validate_non_empty("model_id", &self.model_id)?;
+        validate_non_empty("model_family", &self.model_family)?;
+        validate_non_empty("created_at", &self.created_at)?;
+        if self.input_contracts.is_empty() {
+            return Err("input_contracts must be non-empty".to_string());
+        }
+        for (index, input_contract) in self.input_contracts.iter().enumerate() {
+            validate_non_empty(&format!("input_contracts[{index}]"), input_contract)?;
+            if !is_supported_model_input_contract(input_contract) {
+                return Err(format!("unsupported input contract: {input_contract}"));
+            }
+        }
+        validate_non_empty("output_contract", &self.output_contract)?;
+        validate_non_empty("weights_format", &self.weights_format)?;
+        if !is_supported_weights_format(&self.weights_format) {
+            return Err(format!(
+                "weights_format {} is not supported",
+                self.weights_format
+            ));
+        }
+        validate_non_empty("weights_hash", &self.weights_hash)?;
+        if self.size_bytes == 0 {
+            return Err("size_bytes must be greater than 0".to_string());
+        }
+        validate_non_empty("training_data_manifest", &self.training_data_manifest)?;
+        validate_non_empty("calibration_report", &self.calibration_report)?;
+
+        if let Some(feature_hash) = &self.feature_hash {
+            validate_non_empty("feature_hash", feature_hash)?;
+        }
+        if let Some(quantization) = &self.quantization {
+            validate_non_empty("quantization", quantization)?;
+        }
+        if self.parameter_count == Some(0) {
+            return Err("parameter_count must be greater than 0 when present".to_string());
+        }
+        if let Some(architecture) = &self.architecture {
+            validate_non_empty("architecture", architecture)?;
+        }
+        if let Some(recommended_engine_order) = &self.recommended_engine_order {
+            if recommended_engine_order.is_empty() {
+                return Err("recommended_engine_order must be non-empty when present".to_string());
+            }
+            for (index, engine) in recommended_engine_order.iter().enumerate() {
+                validate_non_empty(&format!("recommended_engine_order[{index}]"), engine)?;
+            }
+        }
+        if let Some(notes) = &self.notes {
+            validate_non_empty("notes", notes)?;
+        }
+        Ok(())
+    }
+}
+
+pub fn parse_model_checkpoint_manifest(text: &str) -> Result<ModelCheckpointManifest, String> {
+    ModelCheckpointManifest::from_json_str(text)
+}
+
+pub fn is_supported_weights_format(weights_format: &str) -> bool {
+    matches!(
+        weights_format,
+        "safetensors" | "onnx" | "npz" | "custom-binary"
+    )
+}
+
+pub fn is_supported_model_input_contract(input_contract: &str) -> bool {
+    SUPPORTED_MODEL_INPUT_CONTRACTS.contains(&input_contract)
+}
+
+fn validate_non_empty(field: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{field} must be non-empty"));
+    }
+    Ok(())
+}
+
+fn required_string(object: &serde_json::Map<String, Value>, field: &str) -> Result<String, String> {
+    let value = object
+        .get(field)
+        .ok_or_else(|| format!("{field} is required"))?;
+    let text = value
+        .as_str()
+        .ok_or_else(|| format!("{field} must be a string"))?;
+    validate_non_empty(field, text)?;
+    Ok(text.to_string())
+}
+
+fn optional_string(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = object.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let text = value
+        .as_str()
+        .ok_or_else(|| format!("{field} must be a string when present"))?;
+    validate_non_empty(field, text)?;
+    Ok(Some(text.to_string()))
+}
+
+fn required_string_list(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Vec<String>, String> {
+    let value = object
+        .get(field)
+        .ok_or_else(|| format!("{field} is required"))?;
+    let array = value
+        .as_array()
+        .ok_or_else(|| format!("{field} must be a list of strings"))?;
+    string_list(field, array)
+}
+
+fn optional_string_list(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = object.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let array = value
+        .as_array()
+        .ok_or_else(|| format!("{field} must be a list of strings when present"))?;
+    Ok(Some(string_list(field, array)?))
+}
+
+fn string_list(field: &str, array: &[Value]) -> Result<Vec<String>, String> {
+    let mut strings = Vec::with_capacity(array.len());
+    for (index, value) in array.iter().enumerate() {
+        let item_field = format!("{field}[{index}]");
+        let text = value
+            .as_str()
+            .ok_or_else(|| format!("{item_field} must be a string"))?;
+        validate_non_empty(&item_field, text)?;
+        strings.push(text.to_string());
+    }
+    Ok(strings)
+}
+
+fn required_u64(object: &serde_json::Map<String, Value>, field: &str) -> Result<u64, String> {
+    let value = object
+        .get(field)
+        .ok_or_else(|| format!("{field} is required"))?;
+    value
+        .as_u64()
+        .ok_or_else(|| format!("{field} must be an unsigned integer"))
+}
+
+fn optional_u64(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<u64>, String> {
+    let Some(value) = object.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_u64()
+        .ok_or_else(|| format!("{field} must be an unsigned integer when present"))
+        .map(Some)
+}
+
+fn optional_bool(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<bool>, String> {
+    let Some(value) = object.get(field) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_bool()
+        .ok_or_else(|| format!("{field} must be a boolean when present"))
+        .map(Some)
+}
 
 pub fn action_index(shape: u8, position: u8) -> u8 {
     shape * 16 + position
@@ -305,5 +579,142 @@ mod tests {
             projected["move_action_indices"].as_array().unwrap().len(),
             3
         );
+    }
+
+    fn valid_model_checkpoint_manifest() -> Value {
+        json!({
+            "schema": MODEL_CHECKPOINT_SCHEMA,
+            "contract_version": MODEL_CHECKPOINT_CONTRACT_VERSION,
+            "model_id": "quantik-policy-value-20260714",
+            "model_family": "policy-value",
+            "created_at": "2026-07-14T12:00:00Z",
+            "input_contracts": ["observation.v1"],
+            "output_contract": "policy-value.v1",
+            "weights_format": "safetensors",
+            "weights_hash": "sha256:0123456789abcdef",
+            "size_bytes": 1024,
+            "training_data_manifest": "training-data-20260714.json",
+            "calibration_report": "calibration-20260714.json",
+            "feature_hash": "sha256:abcdef0123456789",
+            "quantization": "float32",
+            "parameter_count": 123456,
+            "architecture": "tiny-transformer",
+            "legal_action_mask_required": true,
+            "recommended_engine_order": ["rust", "python"],
+            "notes": "fixture manifest"
+        })
+    }
+
+    #[test]
+    fn model_checkpoint_manifest_parses_and_validates_contract_shape() {
+        let manifest =
+            ModelCheckpointManifest::from_json_value(valid_model_checkpoint_manifest()).unwrap();
+
+        assert_eq!(manifest.schema, MODEL_CHECKPOINT_SCHEMA);
+        assert_eq!(manifest.contract_version, MODEL_CHECKPOINT_CONTRACT_VERSION);
+        assert_eq!(manifest.input_contracts, vec!["observation.v1"]);
+        assert_eq!(manifest.weights_format, "safetensors");
+        assert_eq!(manifest.size_bytes, 1024);
+        assert_eq!(manifest.parameter_count, Some(123456));
+        assert_eq!(manifest.legal_action_mask_required, Some(true));
+        assert_eq!(
+            manifest.recommended_engine_order,
+            Some(vec!["rust".to_string(), "python".to_string()])
+        );
+    }
+
+    #[test]
+    fn model_checkpoint_manifest_accepts_opening_book_summary_input_contract() {
+        let mut manifest = valid_model_checkpoint_manifest();
+        manifest["input_contracts"] = json!(["opening-book-summary.v1"]);
+
+        let parsed = ModelCheckpointManifest::from_json_value(manifest).unwrap();
+
+        assert_eq!(parsed.input_contracts, vec!["opening-book-summary.v1"]);
+    }
+
+    #[test]
+    fn model_checkpoint_manifest_rejects_invalid_required_fields() {
+        let cases = [
+            ("wrong schema", json!({"schema": "observation.v1"})),
+            (
+                "wrong contract version",
+                json!({"contract_version": "1.0.0"}),
+            ),
+            ("empty model id", json!({"model_id": ""})),
+            ("empty input contracts", json!({"input_contracts": []})),
+            (
+                "empty input contract value",
+                json!({"input_contracts": [""]}),
+            ),
+            (
+                "unsupported input contract",
+                json!({"input_contracts": ["unknown.v1"]}),
+            ),
+            ("empty output contract", json!({"output_contract": ""})),
+            (
+                "unsupported weights format",
+                json!({"weights_format": "pickle"}),
+            ),
+            ("empty weights hash", json!({"weights_hash": ""})),
+            ("zero size", json!({"size_bytes": 0})),
+            (
+                "empty training data manifest",
+                json!({"training_data_manifest": ""}),
+            ),
+            (
+                "empty calibration report",
+                json!({"calibration_report": ""}),
+            ),
+        ];
+
+        for (label, patch) in cases {
+            let mut manifest = valid_model_checkpoint_manifest();
+            let target = manifest.as_object_mut().unwrap();
+            for (key, value) in patch.as_object().unwrap() {
+                target.insert(key.clone(), value.clone());
+            }
+
+            let error = ModelCheckpointManifest::from_json_value(manifest)
+                .expect_err(label)
+                .to_string();
+            assert!(!error.is_empty(), "expected validation error for {label}");
+        }
+    }
+
+    #[test]
+    fn model_checkpoint_manifest_rejects_mistyped_optional_fields() {
+        let cases = [
+            ("feature_hash", json!(42)),
+            ("quantization", json!(true)),
+            ("parameter_count", json!("many")),
+            ("architecture", json!(["tiny"])),
+            ("legal_action_mask_required", json!("yes")),
+            ("recommended_engine_order", json!(["rust", 7])),
+            ("notes", json!(false)),
+        ];
+
+        for (field, value) in cases {
+            let mut manifest = valid_model_checkpoint_manifest();
+            manifest[field] = value;
+
+            let error = ModelCheckpointManifest::from_json_value(manifest)
+                .expect_err(field)
+                .to_string();
+
+            assert!(error.contains(field), "expected {field} in {error}");
+        }
+    }
+
+    #[test]
+    fn model_checkpoint_fixture_parses() {
+        let manifest = parse_model_checkpoint_manifest(include_str!(
+            "../../tests/fixtures/model-checkpoint-v1.json"
+        ))
+        .unwrap();
+
+        assert_eq!(manifest.schema, MODEL_CHECKPOINT_SCHEMA);
+        assert_eq!(manifest.contract_version, "1.1.0");
+        assert_eq!(manifest.weights_format, "safetensors");
     }
 }
