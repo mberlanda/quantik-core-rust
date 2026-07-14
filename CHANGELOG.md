@@ -4,6 +4,19 @@ All notable changes to `quantik-core` are documented here.
 
 ## Unreleased
 
+## 1.1.0 - 2026-07-14
+
+### Added
+
+- Added `opening-book-summary.v1` export support through
+  `bench_bfs_inspect summary-json` and `scripts/inspect_opening_book.sh
+  summary-json`, allowing Rust-generated depth books to be compared against
+  Python consumers through the contracts `v1.1.0` consistency action.
+- Added a GitHub Actions opening-book consistency job that generates a
+  deterministic depth-4 book, writes the Rust summary, asks the Python stack to
+  consume the same SQLite book, and compares both summaries with
+  `mberlanda/quantik-core-contracts/actions/opening-book-consistency@v1.1.0`.
+
 ## 1.0.0 - 2026-07-13
 
 First published release, mirroring the versioning of the sibling Python

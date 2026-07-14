@@ -10,6 +10,7 @@ Usage:
   scripts/inspect_opening_book.sh stats --db DB [options]
   scripts/inspect_opening_book.sh frontier --db DB [options]
   scripts/inspect_opening_book.sh storage --db DB [options]
+  scripts/inspect_opening_book.sh summary-json --db DB --depth N --output PATH [options]
   scripts/inspect_opening_book.sh resume-command --db DB --depth N [options]
 
 Commands:
@@ -18,12 +19,14 @@ Commands:
   frontier        Print sample non-terminal rows that need more search for a
                   target depth.
   storage         Print SQLite page/object storage details.
+  summary-json    Write opening-book-summary.v1 JSON for cross-stack checks.
   resume-command  Print the opening-book search command that resumes DB to N.
 
 Options:
   --db PATH              bench_bfs SQLite database
   --depth N             Target depth for stats/frontier/resume-command
   --limit N             Frontier sample size
+  --output PATH         Summary JSON output path
   --profile NAME        Cargo profile: release or debug (default: release)
   --dry-run             Print the cargo command without running it
   -h, --help            Show this help
@@ -42,12 +45,14 @@ dry_run="0"
 db=""
 depth=""
 limit=""
+output=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --db) db="$2"; shift 2 ;;
     --depth|--target-depth) depth="$2"; shift 2 ;;
     --limit) limit="$2"; shift 2 ;;
+    --output) output="$2"; shift 2 ;;
     --profile) profile="$2"; shift 2 ;;
     --dry-run) dry_run="1"; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -56,7 +61,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$command" in
-  stats|frontier|storage|resume-command) ;;
+  stats|frontier|storage|summary-json|resume-command) ;;
   -h|--help) usage; exit 0 ;;
   *) printf 'error: unknown command %q\n' "$command" >&2; usage >&2; exit 2 ;;
 esac
@@ -69,6 +74,11 @@ if [[ "$command" == "resume-command" ]]; then
   exit 0
 fi
 
+if [[ "$command" == "summary-json" ]]; then
+  require_value "--depth" "$depth"
+  require_value "--output" "$output"
+fi
+
 cd "$repo_root"
 cmd=(cargo run)
 release_flag="$(profile_flag "$profile")"
@@ -77,11 +87,17 @@ if [[ -n "$release_flag" ]]; then
 fi
 
 cmd+=(--bin bench_bfs_inspect -- --db "$db" "$command")
-if [[ -n "$depth" ]]; then
+if [[ -n "$depth" && "$command" != "summary-json" ]]; then
   cmd+=(--target-depth "$depth")
 fi
 if [[ -n "$limit" ]]; then
   cmd+=(--limit "$limit")
+fi
+if [[ -n "$depth" && "$command" == "summary-json" ]]; then
+  cmd+=(--expected-depth "$depth")
+fi
+if [[ -n "$output" ]]; then
+  cmd+=(--output "$output")
 fi
 
 run_or_dry_run "$dry_run" "${cmd[@]}"
