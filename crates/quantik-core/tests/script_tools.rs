@@ -101,6 +101,31 @@ fn opening_book_inspection_renders_stats_command() {
 }
 
 #[test]
+fn opening_book_inspection_renders_summary_json_command() {
+    let (success, text) = run_script(
+        "inspect_opening_book.sh",
+        &[
+            "summary-json",
+            "--db",
+            "benchmarks/results/depth4-book.sqlite",
+            "--depth",
+            "4",
+            "--output",
+            "benchmarks/results/rust-summary.json",
+            "--dry-run",
+        ],
+    );
+
+    assert!(success, "dry run failed:\n{text}");
+    assert!(text.contains("bench_bfs_inspect"), "{text}");
+    assert!(text.contains("summary-json --expected-depth 4"), "{text}");
+    assert!(
+        text.contains("--output benchmarks/results/rust-summary.json"),
+        "{text}"
+    );
+}
+
+#[test]
 fn opening_book_inspection_prints_resume_command() {
     let (success, text) = run_script(
         "inspect_opening_book.sh",

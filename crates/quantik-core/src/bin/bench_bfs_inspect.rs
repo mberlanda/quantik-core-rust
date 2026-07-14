@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use rusqlite::{params, Connection};
+use serde::Serialize;
 
 #[derive(Parser)]
 #[command(
@@ -35,6 +36,16 @@ enum Command {
     },
     /// Print SQLite page/index/storage details.
     Storage,
+    /// Write opening-book-summary.v1 JSON for cross-stack consistency checks.
+    SummaryJson {
+        /// Expected book depth represented by the summary.
+        #[arg(long)]
+        expected_depth: usize,
+
+        /// Output JSON path.
+        #[arg(long)]
+        output: String,
+    },
 }
 
 fn main() -> Result<(), String> {
@@ -49,8 +60,31 @@ fn main() -> Result<(), String> {
             limit,
         } => print_frontier(&conn, target_depth, limit)?,
         Command::Storage => print_storage(&conn, &cli.db)?,
+        Command::SummaryJson {
+            expected_depth,
+            output,
+        } => write_summary_json(&conn, expected_depth, &output)?,
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct OpeningBookSummary {
+    schema: &'static str,
+    contract_version: &'static str,
+    depth: usize,
+    total_positions: i64,
+    terminal_positions: i64,
+    total_edges: i64,
+    per_depth: Vec<DepthSummary>,
+}
+
+#[derive(Serialize)]
+struct DepthSummary {
+    depth: i64,
+    positions: i64,
+    terminal: i64,
+    edges: i64,
 }
 
 fn validate_schema(conn: &Connection) -> Result<(), String> {
@@ -262,5 +296,74 @@ fn print_storage(conn: &Connection, path: &str) -> Result<(), String> {
         let (kind, name) = row.map_err(|e| format!("read object row: {e}"))?;
         println!("  {kind:5} {name}");
     }
+    Ok(())
+}
+
+fn write_summary_json(
+    conn: &Connection,
+    expected_depth: usize,
+    output: &str,
+) -> Result<(), String> {
+    let depth = max_depth(conn)?;
+    if depth != expected_depth {
+        return Err(format!(
+            "database max depth {depth} does not match expected depth {expected_depth}"
+        ));
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.depth,
+                    COUNT(*) AS positions,
+                    COALESCE(SUM(p.is_terminal), 0) AS terminal,
+                    (SELECT COUNT(*) FROM edges e
+                     JOIN positions pp ON pp.canonical_key = e.parent_key
+                     WHERE pp.depth = p.depth) AS edge_count
+             FROM positions p
+             GROUP BY p.depth
+             ORDER BY p.depth",
+        )
+        .map_err(|e| format!("prepare summary query: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(DepthSummary {
+                depth: row.get(0)?,
+                positions: row.get(1)?,
+                terminal: row.get(2)?,
+                edges: row.get(3)?,
+            })
+        })
+        .map_err(|e| format!("query summary: {e}"))?;
+
+    let mut per_depth = Vec::new();
+    for row in rows {
+        per_depth.push(row.map_err(|e| format!("read summary row: {e}"))?);
+    }
+    if per_depth.len() != expected_depth + 1 {
+        return Err(format!(
+            "expected {} per-depth rows, found {}",
+            expected_depth + 1,
+            per_depth.len()
+        ));
+    }
+
+    let total_positions = per_depth.iter().map(|row| row.positions).sum();
+    let terminal_positions = per_depth.iter().map(|row| row.terminal).sum();
+    let total_edges = per_depth.iter().map(|row| row.edges).sum();
+    let summary = OpeningBookSummary {
+        schema: "opening-book-summary.v1",
+        contract_version: "1.1.0",
+        depth: expected_depth,
+        total_positions,
+        terminal_positions,
+        total_edges,
+        per_depth,
+    };
+
+    let json = serde_json::to_string_pretty(&summary)
+        .map_err(|e| format!("serialize summary json: {e}"))?;
+    std::fs::write(output, format!("{json}\n"))
+        .map_err(|e| format!("write summary json {output}: {e}"))?;
+    println!("Wrote opening-book-summary.v1: {output}");
     Ok(())
 }
