@@ -236,7 +236,7 @@ pub fn parse_selfplay_row(value: &Value) -> Result<SelfPlayRow, String> {
     let object = value
         .as_object()
         .ok_or("selfplay row must be a JSON object")?;
-    validate_schema_with_optional_version(object, SELFPLAY_SCHEMA, CONTRACT_VERSION)?;
+    validate_schema_with_optional_version(object, SELFPLAY_SCHEMA, SELFPLAY_CONTRACT_VERSION)?;
 
     let game_id = required_u64(object, "game_id")?;
     let ply = required_u64(object, "ply")?;
@@ -573,7 +573,7 @@ pub fn selfplay_v1_row(
     }
     let record = json!({
         "schema": SELFPLAY_SCHEMA,
-        "contract_version": CONTRACT_VERSION,
+        "contract_version": SELFPLAY_CONTRACT_VERSION,
         "game_id": game_id,
         "ply": ply,
         "qfen": qfen,
@@ -1022,7 +1022,7 @@ fn selfplay_arrow_parquet_schema() -> Arc<arrow_schema::Schema> {
 
     let metadata = HashMap::from([
         (
-            "physical_schema".to_string(),
+            "schema".to_string(),
             ARROW_PARQUET_SELFPLAY_SCHEMA.to_string(),
         ),
         ("logical_schema".to_string(), SELFPLAY_SCHEMA.to_string()),
@@ -1065,7 +1065,7 @@ fn selfplay_arrow_parquet_schema() -> Arc<arrow_schema::Schema> {
 fn selfplay_arrow_parquet_metadata() -> Vec<parquet::file::metadata::KeyValue> {
     vec![
         parquet::file::metadata::KeyValue {
-            key: "physical_schema".to_string(),
+            key: "schema".to_string(),
             value: Some(ARROW_PARQUET_SELFPLAY_SCHEMA.to_string()),
         },
         parquet::file::metadata::KeyValue {
@@ -1102,24 +1102,46 @@ fn validate_selfplay_arrow_parquet_metadata(
         })
         .collect::<HashMap<_, _>>();
 
-    validate_metadata_value(&metadata, "physical_schema", ARROW_PARQUET_SELFPLAY_SCHEMA)?;
-    validate_metadata_value(&metadata, "logical_schema", SELFPLAY_SCHEMA)?;
-    validate_metadata_value(&metadata, "logical_contract", SELFPLAY_SCHEMA)?;
-    validate_metadata_value(&metadata, "contracts_release", SELFPLAY_CONTRACT_VERSION)?;
-    validate_metadata_value(&metadata, "contract_version", SELFPLAY_CONTRACT_VERSION)?;
+    validate_metadata_value_with_alias(
+        &metadata,
+        "schema",
+        Some("physical_schema"),
+        ARROW_PARQUET_SELFPLAY_SCHEMA,
+    )?;
+    validate_metadata_value_with_alias(
+        &metadata,
+        "logical_contract",
+        Some("logical_schema"),
+        SELFPLAY_SCHEMA,
+    )?;
+    validate_metadata_value_with_alias(
+        &metadata,
+        "contract_version",
+        Some("contracts_release"),
+        SELFPLAY_CONTRACT_VERSION,
+    )?;
     Ok(())
 }
 
 #[cfg(feature = "arrow-parquet")]
-fn validate_metadata_value(
+fn validate_metadata_value_with_alias(
     metadata: &HashMap<&str, &str>,
     key: &str,
+    alias: Option<&str>,
     expected: &str,
 ) -> Result<(), String> {
-    let actual = metadata
+    let actual: &str = metadata
         .get(key)
-        .ok_or_else(|| format!("parquet metadata {key} is required"))?;
-    if *actual != expected {
+        .copied()
+        .or_else(|| alias.and_then(|alias| metadata.get(alias).copied()))
+        .ok_or_else(|| {
+            if let Some(alias) = alias {
+                format!("parquet metadata {key} (or {alias}) is required")
+            } else {
+                format!("parquet metadata {key} is required")
+            }
+        })?;
+    if actual != expected {
         return Err(format!(
             "parquet metadata {key} must be {expected}, got {actual}"
         ));
@@ -1927,13 +1949,14 @@ mod tests {
     #[test]
     fn selfplay_arrow_parquet_reader_rejects_drifted_metadata() {
         let path = temp_selfplay_parquet_path("bad-metadata");
-        write_test_selfplay_parquet(&path, "selfplay.v2", 64).unwrap();
+        write_test_selfplay_parquet(&path, "selfplay.v2", 64, Some("A.../..../..../....")).unwrap();
 
         let error = read_selfplay_arrow_parquet(&path).expect_err("metadata drift must fail");
         std::fs::remove_file(&path).ok();
 
         assert!(
-            error.contains("logical_schema"),
+            error.contains("parquet metadata logical_contract must be selfplay.v1")
+                && error.contains("selfplay.v2"),
             "unexpected error: {error}"
         );
     }
@@ -1942,7 +1965,8 @@ mod tests {
     #[test]
     fn selfplay_arrow_parquet_reader_rejects_drifted_physical_shape() {
         let path = temp_selfplay_parquet_path("bad-policy-shape");
-        write_test_selfplay_parquet(&path, SELFPLAY_SCHEMA, 63).unwrap();
+        write_test_selfplay_parquet(&path, SELFPLAY_SCHEMA, 63, Some("A.../..../..../...."))
+            .unwrap();
 
         let error = read_selfplay_arrow_parquet(&path).expect_err("shape drift must fail");
         std::fs::remove_file(&path).ok();
@@ -1951,6 +1975,22 @@ mod tests {
             error.contains("schema") || error.contains("policy_visits"),
             "unexpected error: {error}"
         );
+    }
+
+    #[cfg(feature = "arrow-parquet")]
+    #[test]
+    fn selfplay_arrow_parquet_reader_accepts_nullable_qfen() {
+        let path = temp_selfplay_parquet_path("null-qfen");
+        write_test_selfplay_parquet(&path, SELFPLAY_SCHEMA, 64, None).unwrap();
+
+        let rows = read_selfplay_arrow_parquet(&path).expect("nullable qfen should be supported");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].side_to_move, 1);
+        assert_eq!(rows[0].qfen, "A.../..../..../....");
+        let state = State::from_qfen(&rows[0].qfen).expect("derived qfen must be valid");
+        assert_eq!(state.bb.planes, [1, 0, 0, 0, 0, 0, 0, 0]);
     }
 
     #[cfg(feature = "arrow-parquet")]
@@ -1966,6 +2006,7 @@ mod tests {
         path: &std::path::Path,
         logical_schema: &str,
         policy_len: i32,
+        qfen: Option<&str>,
     ) -> Result<(), String> {
         use arrow_array::{
             ArrayRef, FixedSizeListArray, Int8Array, RecordBatch, StringArray, UInt16Array,
@@ -2031,14 +2072,14 @@ mod tests {
                 Arc::new(bitboards) as ArrayRef,
                 Arc::new(policy_visits) as ArrayRef,
                 Arc::new(Int8Array::from(vec![-1])) as ArrayRef,
-                Arc::new(StringArray::from(vec!["A.../..../..../...."])) as ArrayRef,
+                Arc::new(StringArray::from(vec![qfen])) as ArrayRef,
             ],
         )
         .map_err(|e| format!("build batch: {e}"))?;
         let props = WriterProperties::builder()
             .set_key_value_metadata(Some(vec![
                 KeyValue {
-                    key: "physical_schema".to_string(),
+                    key: "schema".to_string(),
                     value: Some(ARROW_PARQUET_SELFPLAY_SCHEMA.to_string()),
                 },
                 KeyValue {
@@ -2047,7 +2088,7 @@ mod tests {
                 },
                 KeyValue {
                     key: "logical_contract".to_string(),
-                    value: Some(SELFPLAY_SCHEMA.to_string()),
+                    value: Some(logical_schema.to_string()),
                 },
                 KeyValue {
                     key: "contracts_release".to_string(),
