@@ -1,0 +1,2 @@
+{"contract_version":"1.1.0","game_id":0,"ply":0,"policy":[{"position":0,"shape":0,"visits":3},{"position":5,"shape":1,"visits":1}],"qfen":"..../..../..../....","schema":"selfplay.v1","side_to_move":0,"value":1.0}
+{"contract_version":"1.1.0","game_id":0,"ply":1,"policy":[{"position":10,"shape":0,"visits":2},{"position":1,"shape":1,"visits":6}],"qfen":"A.../..../..../....","schema":"selfplay.v1","side_to_move":1,"value":-1.0}
