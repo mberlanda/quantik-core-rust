@@ -15,6 +15,7 @@ pub mod correctness;
 pub mod dataset;
 pub mod head_to_head;
 pub mod metrics;
+pub mod portability;
 pub mod reference;
 pub mod report;
 pub mod stability;
