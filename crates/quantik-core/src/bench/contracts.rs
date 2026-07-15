@@ -2676,6 +2676,67 @@ mod tests {
     }
 
     #[test]
+    fn selfplay_rust_smoke_fixture_is_builder_output() {
+        let rows = [
+            selfplay_v1_row(
+                0,
+                0,
+                "..../..../..../....",
+                0,
+                &[
+                    SelfPlayPolicyVisit {
+                        shape: 0,
+                        position: 0,
+                        visits: 3,
+                    },
+                    SelfPlayPolicyVisit {
+                        shape: 1,
+                        position: 5,
+                        visits: 1,
+                    },
+                ],
+                1.0,
+            )
+            .unwrap(),
+            selfplay_v1_row(
+                0,
+                1,
+                "A.../..../..../....",
+                1,
+                &[
+                    SelfPlayPolicyVisit {
+                        shape: 0,
+                        position: 10,
+                        visits: 2,
+                    },
+                    SelfPlayPolicyVisit {
+                        shape: 1,
+                        position: 1,
+                        visits: 6,
+                    },
+                ],
+                -1.0,
+            )
+            .unwrap(),
+        ];
+        let generated = rows
+            .iter()
+            .map(canonical_json)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+
+        assert_eq!(
+            generated,
+            include_str!("../../tests/fixtures/selfplay-v1-rust-smoke.jsonl")
+        );
+        for line in generated.lines() {
+            let value: Value = serde_json::from_str(line).unwrap();
+            parse_selfplay_row(&value).unwrap();
+        }
+    }
+
+    #[test]
     fn selfplay_parser_rejects_drifted_or_inconsistent_rows() {
         let valid = json!({
             "schema": SELFPLAY_SCHEMA,
