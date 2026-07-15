@@ -246,7 +246,13 @@ impl OpeningBookDatabase {
     /// with partial `best_moves`.
     ///
     /// Visit/win/draw counters and `symmetry_count` are not meaningful for
-    /// a solved reference and are stored as `0`.
+    /// a solved reference and are initialized to `0` on first insert. When
+    /// the row already exists, only the columns this API owns (`qfen`,
+    /// `depth`, `evaluation`, `solved`, `game_value`) are updated: counters,
+    /// terminal/symmetry fields, and any extra columns from other schemas
+    /// (e.g. `bench_bfs` search metadata like `searched_depth`/`status`)
+    /// are left untouched — a plain `INSERT OR REPLACE` would delete and
+    /// re-insert the row, silently resetting them.
     pub fn add_solved_position(
         &self,
         state: &State,
@@ -264,11 +270,17 @@ impl OpeningBookDatabase {
 
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT OR REPLACE INTO positions
+            "INSERT INTO positions
              (canonical_key, qfen, depth, evaluation, visit_count,
               win_count_p0, win_count_p1, draw_count, is_terminal, symmetry_count,
               solved, game_value)
-             VALUES (?1, ?2, ?3, ?4, 0, 0, 0, 0, ?5, 0, 1, ?6)",
+             VALUES (?1, ?2, ?3, ?4, 0, 0, 0, 0, ?5, 0, 1, ?6)
+             ON CONFLICT(canonical_key) DO UPDATE SET
+               qfen = excluded.qfen,
+               depth = excluded.depth,
+               evaluation = excluded.evaluation,
+               solved = excluded.solved,
+               game_value = excluded.game_value",
             params![
                 canonical_key,
                 qfen,
@@ -819,6 +831,22 @@ mod tests {
         assert!(entry.solved);
         assert_eq!(entry.game_value, Some(1));
         assert_eq!(entry.best_moves, vec![(0, 0)]);
+
+        // The write-back must not destroy bench_bfs search metadata: the
+        // searched row was inserted with searched_depth = 1 and status = 1,
+        // and those bench-owned columns must survive the solved upsert
+        // (INSERT OR REPLACE would delete + re-insert the row and reset
+        // them to their defaults).
+        let (searched_depth, status): (i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT searched_depth, status FROM positions WHERE canonical_key = ?1",
+                params![State::empty().canonical_key().to_vec()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(searched_depth, 1);
+        assert_eq!(status, 1);
 
         // Re-opening again (columns already present) must also succeed.
         OpeningBookDatabase::open(&config).unwrap();
