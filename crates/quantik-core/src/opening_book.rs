@@ -141,9 +141,28 @@ impl OpeningBookDatabase {
 
         // These indexes reference columns that may only exist after the
         // migration above, so they cannot be created in the initial batch.
+        //
+        // The position_edges index must NOT be named `idx_edges_child`:
+        // searched books already carry an index of that name on their
+        // `edges` table, and SQLite index names are database-global, so
+        // `CREATE INDEX IF NOT EXISTS` under the colliding name would
+        // silently skip indexing position_edges. Books written before the
+        // rename carry `idx_edges_child` on position_edges itself; drop
+        // that one (and only that one) so the rename does not leave a
+        // duplicate index behind.
+        let legacy_edge_index: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_edges_child'
+               AND tbl_name = 'position_edges'",
+            [],
+            |row| row.get(0),
+        )?;
+        if legacy_edge_index > 0 {
+            conn.execute_batch("DROP INDEX idx_edges_child;")?;
+        }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_visit_count ON positions(visit_count DESC);
-             CREATE INDEX IF NOT EXISTS idx_edges_child ON position_edges(child_key);",
+             CREATE INDEX IF NOT EXISTS idx_position_edges_child ON position_edges(child_key);",
         )?;
 
         Ok(Self {
@@ -635,7 +654,13 @@ mod tests {
                     shape INTEGER NOT NULL,
                     position INTEGER NOT NULL,
                     PRIMARY KEY (canonical_key, move_rank)
-                );",
+                );
+                CREATE TABLE position_edges (
+                    parent_key BLOB NOT NULL,
+                    child_key  BLOB NOT NULL,
+                    PRIMARY KEY (parent_key, child_key)
+                );
+                CREATE INDEX idx_edges_child ON position_edges(child_key);",
             )
             .unwrap();
 
@@ -662,6 +687,27 @@ mod tests {
         assert!(!entry.solved);
         assert_eq!(entry.game_value, None);
         assert_eq!(entry.visit_count, 7);
+
+        // The legacy `idx_edges_child` index on position_edges is renamed:
+        // dropped and re-created as `idx_position_edges_child`, with no
+        // duplicate left behind.
+        let index_names: Vec<String> = {
+            let mut stmt = db
+                .conn
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'index' AND tbl_name = 'position_edges'
+                       AND name NOT LIKE 'sqlite_autoindex%'",
+                )
+                .unwrap();
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            names
+        };
+        assert_eq!(index_names, vec!["idx_position_edges_child".to_string()]);
 
         // Re-opening again (columns already present) must also succeed.
         OpeningBookDatabase::open(&config).unwrap();
@@ -701,7 +747,11 @@ mod tests {
                     child_key BLOB NOT NULL,
                     move TEXT NOT NULL,
                     PRIMARY KEY (parent_key, child_key)
-                );",
+                );
+                CREATE INDEX idx_edges_child ON edges(child_key);
+                CREATE INDEX idx_pos_depth ON positions(depth);
+                CREATE INDEX idx_pos_status ON positions(status);
+                CREATE INDEX idx_pos_searched ON positions(searched_depth);",
             )
             .unwrap();
 
@@ -721,6 +771,35 @@ mod tests {
             ..Default::default()
         };
         let db = OpeningBookDatabase::open(&config).unwrap();
+
+        // position_edges must get its own child_key index even though the
+        // searched book already has an `idx_edges_child` index on the
+        // unrelated `edges` table (SQLite index names are database-global,
+        // so a colliding name would make CREATE INDEX IF NOT EXISTS a
+        // silent no-op).
+        let edge_indexes: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'position_edges'
+                   AND name = 'idx_position_edges_child'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edge_indexes, 1);
+        // The searched book's own edges index must be left untouched.
+        let bench_indexes: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'edges'
+                   AND name = 'idx_edges_child'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bench_indexes, 1);
 
         // The searched row reads back with migrated defaults and must not
         // look like a solved reference.
