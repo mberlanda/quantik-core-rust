@@ -104,16 +104,31 @@ impl OpeningBookDatabase {
                 FOREIGN KEY (parent_key) REFERENCES positions(canonical_key),
                 FOREIGN KEY (child_key)  REFERENCES positions(canonical_key)
             );
-            CREATE INDEX IF NOT EXISTS idx_depth ON positions(depth);
-            CREATE INDEX IF NOT EXISTS idx_visit_count ON positions(visit_count DESC);
-            CREATE INDEX IF NOT EXISTS idx_edges_child ON position_edges(child_key);",
+            CREATE INDEX IF NOT EXISTS idx_depth ON positions(depth);",
         )?;
 
-        // Idempotent migration for DBs created before the `solved`/
-        // `game_value` columns existed: SQLite has no `ADD COLUMN IF NOT
-        // EXISTS`, so attempt the ALTER and swallow the "duplicate column
-        // name" error it raises when the column is already there.
+        // Idempotent migration for pre-existing `positions` tables that
+        // lack some of the columns above: SQLite has no `ADD COLUMN IF
+        // NOT EXISTS`, so attempt each ALTER and swallow the "duplicate
+        // column name" error it raises when the column is already there.
+        // This covers two kinds of DBs:
+        // - books created before the `solved`/`game_value` columns
+        //   existed, and
+        // - searched books built by `bench_bfs`, whose `positions` table
+        //   has only structural search columns (no `qfen`, `evaluation`,
+        //   `visit_count`, win/draw counters, `solved`, `game_value`).
+        //   Migrated searched rows keep these defaults and are therefore
+        //   never served as solved references (lookups require
+        //   `solved = 1`); solved write-backs upsert over them.
+        // `created_at` is deliberately not migrated: ALTER TABLE cannot
+        // add a column with a non-constant default, and no query reads it.
         for stmt in [
+            "ALTER TABLE positions ADD COLUMN qfen TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE positions ADD COLUMN evaluation REAL NOT NULL DEFAULT 0",
+            "ALTER TABLE positions ADD COLUMN visit_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE positions ADD COLUMN win_count_p0 INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE positions ADD COLUMN win_count_p1 INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE positions ADD COLUMN draw_count INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE positions ADD COLUMN solved INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE positions ADD COLUMN game_value INTEGER",
         ] {
@@ -123,6 +138,32 @@ impl OpeningBookDatabase {
                 }
             }
         }
+
+        // These indexes reference columns that may only exist after the
+        // migration above, so they cannot be created in the initial batch.
+        //
+        // The position_edges index must NOT be named `idx_edges_child`:
+        // searched books already carry an index of that name on their
+        // `edges` table, and SQLite index names are database-global, so
+        // `CREATE INDEX IF NOT EXISTS` under the colliding name would
+        // silently skip indexing position_edges. Books written before the
+        // rename carry `idx_edges_child` on position_edges itself; drop
+        // that one (and only that one) so the rename does not leave a
+        // duplicate index behind.
+        let legacy_edge_index: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_edges_child'
+               AND tbl_name = 'position_edges'",
+            [],
+            |row| row.get(0),
+        )?;
+        if legacy_edge_index > 0 {
+            conn.execute_batch("DROP INDEX idx_edges_child;")?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_visit_count ON positions(visit_count DESC);
+             CREATE INDEX IF NOT EXISTS idx_position_edges_child ON position_edges(child_key);",
+        )?;
 
         Ok(Self {
             conn,
@@ -205,7 +246,13 @@ impl OpeningBookDatabase {
     /// with partial `best_moves`.
     ///
     /// Visit/win/draw counters and `symmetry_count` are not meaningful for
-    /// a solved reference and are stored as `0`.
+    /// a solved reference and are initialized to `0` on first insert. When
+    /// the row already exists, only the columns this API owns (`qfen`,
+    /// `depth`, `evaluation`, `solved`, `game_value`) are updated: counters,
+    /// terminal/symmetry fields, and any extra columns from other schemas
+    /// (e.g. `bench_bfs` search metadata like `searched_depth`/`status`)
+    /// are left untouched — a plain `INSERT OR REPLACE` would delete and
+    /// re-insert the row, silently resetting them.
     pub fn add_solved_position(
         &self,
         state: &State,
@@ -223,11 +270,17 @@ impl OpeningBookDatabase {
 
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT OR REPLACE INTO positions
+            "INSERT INTO positions
              (canonical_key, qfen, depth, evaluation, visit_count,
               win_count_p0, win_count_p1, draw_count, is_terminal, symmetry_count,
               solved, game_value)
-             VALUES (?1, ?2, ?3, ?4, 0, 0, 0, 0, ?5, 0, 1, ?6)",
+             VALUES (?1, ?2, ?3, ?4, 0, 0, 0, 0, ?5, 0, 1, ?6)
+             ON CONFLICT(canonical_key) DO UPDATE SET
+               qfen = excluded.qfen,
+               depth = excluded.depth,
+               evaluation = excluded.evaluation,
+               solved = excluded.solved,
+               game_value = excluded.game_value",
             params![
                 canonical_key,
                 qfen,
@@ -613,7 +666,13 @@ mod tests {
                     shape INTEGER NOT NULL,
                     position INTEGER NOT NULL,
                     PRIMARY KEY (canonical_key, move_rank)
-                );",
+                );
+                CREATE TABLE position_edges (
+                    parent_key BLOB NOT NULL,
+                    child_key  BLOB NOT NULL,
+                    PRIMARY KEY (parent_key, child_key)
+                );
+                CREATE INDEX idx_edges_child ON position_edges(child_key);",
             )
             .unwrap();
 
@@ -640,6 +699,154 @@ mod tests {
         assert!(!entry.solved);
         assert_eq!(entry.game_value, None);
         assert_eq!(entry.visit_count, 7);
+
+        // The legacy `idx_edges_child` index on position_edges is renamed:
+        // dropped and re-created as `idx_position_edges_child`, with no
+        // duplicate left behind.
+        let index_names: Vec<String> = {
+            let mut stmt = db
+                .conn
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'index' AND tbl_name = 'position_edges'
+                       AND name NOT LIKE 'sqlite_autoindex%'",
+                )
+                .unwrap();
+            let names = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            names
+        };
+        assert_eq!(index_names, vec!["idx_position_edges_child".to_string()]);
+
+        // Re-opening again (columns already present) must also succeed.
+        OpeningBookDatabase::open(&config).unwrap();
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// Opening a searched book built by `bench_bfs` (positions table with
+    /// only structural search columns — no `qfen`/`evaluation`/
+    /// `visit_count`/win counters/`solved`) must upgrade it in place so
+    /// the benchmark read-through path (`generate_positions.sh --book`)
+    /// can open it: pre-existing searched rows read back with migrated
+    /// defaults and are never served as solved references, and solved
+    /// write-backs upsert over them.
+    #[test]
+    fn migration_upgrades_bench_bfs_searched_book() {
+        let path = temp_db_path();
+
+        // Build the bench_bfs schema by hand (mirrors the CREATE TABLE in
+        // src/bin/bench_bfs.rs) and insert the empty-board row via raw
+        // SQL, bypassing OpeningBookDatabase entirely.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE positions (
+                    canonical_key BLOB PRIMARY KEY,
+                    depth INTEGER NOT NULL,
+                    is_terminal INTEGER NOT NULL DEFAULT 0,
+                    winner INTEGER,
+                    symmetry_count INTEGER NOT NULL,
+                    searched_depth INTEGER NOT NULL DEFAULT 0,
+                    score REAL,
+                    status INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE edges (
+                    parent_key BLOB NOT NULL,
+                    child_key BLOB NOT NULL,
+                    move TEXT NOT NULL,
+                    PRIMARY KEY (parent_key, child_key)
+                );
+                CREATE INDEX idx_edges_child ON edges(child_key);
+                CREATE INDEX idx_pos_depth ON positions(depth);
+                CREATE INDEX idx_pos_status ON positions(status);
+                CREATE INDEX idx_pos_searched ON positions(searched_depth);",
+            )
+            .unwrap();
+
+            let state = State::empty();
+            conn.execute(
+                "INSERT INTO positions
+                 (canonical_key, depth, is_terminal, winner, symmetry_count,
+                  searched_depth, score, status)
+                 VALUES (?1, 0, 0, NULL, 1, 1, NULL, 1)",
+                params![state.canonical_key().to_vec()],
+            )
+            .unwrap();
+        }
+
+        let config = OpeningBookConfig {
+            database_path: path.clone(),
+            ..Default::default()
+        };
+        let db = OpeningBookDatabase::open(&config).unwrap();
+
+        // position_edges must get its own child_key index even though the
+        // searched book already has an `idx_edges_child` index on the
+        // unrelated `edges` table (SQLite index names are database-global,
+        // so a colliding name would make CREATE INDEX IF NOT EXISTS a
+        // silent no-op).
+        let edge_indexes: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'position_edges'
+                   AND name = 'idx_position_edges_child'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(edge_indexes, 1);
+        // The searched book's own edges index must be left untouched.
+        let bench_indexes: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND tbl_name = 'edges'
+                   AND name = 'idx_edges_child'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bench_indexes, 1);
+
+        // The searched row reads back with migrated defaults and must not
+        // look like a solved reference.
+        let entry = db.get_position(&State::empty()).unwrap().unwrap();
+        assert!(!entry.solved);
+        assert_eq!(entry.game_value, None);
+        assert_eq!(entry.visit_count, 0);
+        assert_eq!(entry.qfen, "");
+        assert!(entry.best_moves.is_empty());
+
+        // Solved write-back upserts over the searched row.
+        let written = db
+            .add_solved_position(&State::empty(), 1, &[(0, 0)])
+            .unwrap();
+        assert!(written);
+        let entry = db.get_position(&State::empty()).unwrap().unwrap();
+        assert!(entry.solved);
+        assert_eq!(entry.game_value, Some(1));
+        assert_eq!(entry.best_moves, vec![(0, 0)]);
+
+        // The write-back must not destroy bench_bfs search metadata: the
+        // searched row was inserted with searched_depth = 1 and status = 1,
+        // and those bench-owned columns must survive the solved upsert
+        // (INSERT OR REPLACE would delete + re-insert the row and reset
+        // them to their defaults).
+        let (searched_depth, status): (i64, i64) = db
+            .conn
+            .query_row(
+                "SELECT searched_depth, status FROM positions WHERE canonical_key = ?1",
+                params![State::empty().canonical_key().to_vec()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(searched_depth, 1);
+        assert_eq!(status, 1);
 
         // Re-opening again (columns already present) must also succeed.
         OpeningBookDatabase::open(&config).unwrap();

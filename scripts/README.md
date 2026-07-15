@@ -18,6 +18,21 @@ scripts/generate_positions.sh \
 The underlying Rust dataset generator deduplicates positions by canonical key
 and rejects terminal/dead-end positions.
 
+Pass `--book PATH` to reuse (and write back) exact solved references from an
+opening-book SQLite database. Both book flavors work: a benchmark book built
+with `generate_opening_book.sh export`, and a searched book built with
+`generate_opening_book.sh search` (`bench_bfs`). A searched book is upgraded
+in place on open — the missing benchmark-book columns are added with default
+values — so its searched rows are never served as solved references, while
+newly solved positions are written back into the same file:
+
+```sh
+scripts/generate_positions.sh \
+  --opening 250 --early-mid 250 --late-mid 250 --endgame 250 \
+  --book benchmarks/results/depth6-book.sqlite \
+  --output benchmarks/positions-1000.json
+```
+
 ## Opening Book
 
 Export exact solved references from a positions dataset:
