@@ -19,6 +19,9 @@ mirror, then contract registration).
 
 See also:
 - Design spec: `docs/superpowers/specs/2026-07-16-search-telemetry-design.md`
+  (lands via the companion docs PR
+  [#34](https://github.com/mberlanda/quantik-core-rust/pull/34); path is
+  dangling until that merges)
 - Contract doc (sibling repo `quantik-core-contracts`, path
   `docs/search-summary-v1.md`): the registration target this surface feeds.
 
