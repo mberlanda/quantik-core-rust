@@ -162,6 +162,18 @@ scripts/generate_h2h_stats.sh report \
   --report-output benchmarks/results/mcts-vs-minimax.md
 ```
 
+## Search Telemetry Export
+
+Export draft `search-summary.v1-draft` JSONL rows (event counters, root-move
+statistics, principal variation) for MCTS, beam, and minimax over a small
+fixed position set — see `docs/search-telemetry.md` for the event semantics
+and value-mapping details:
+
+```sh
+cargo run -p quantik-core --example search_summary_export -- \
+  --out benchmarks/results/search-summaries.jsonl
+```
+
 ## Parameter Matrices
 
 Expand combinations into runnable commands:

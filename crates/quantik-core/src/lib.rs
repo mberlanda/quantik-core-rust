@@ -10,5 +10,6 @@ pub mod minimax;
 pub mod moves;
 pub mod opening_book;
 pub mod qfen;
+pub mod search_telemetry;
 pub mod state;
 pub mod symmetry;

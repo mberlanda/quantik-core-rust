@@ -1,6 +1,9 @@
 use crate::bitboard::Bitboard;
 use crate::game::{check_winner, current_player, WinStatus};
 use crate::moves::{apply_move, generate_legal_moves, Move};
+use crate::search_telemetry::{
+    clamp_unproven, EngineKind, PolicyMassKind, RootMoveStat, SearchEventCounters, SearchTelemetry,
+};
 use crate::state::State;
 use rand::prelude::*;
 use std::collections::HashMap;
@@ -52,6 +55,9 @@ pub struct MCTSEngine {
     transpositions: HashMap<[u8; 18], usize>,
     rng: StdRng,
     iterations_performed: u32,
+    counters: SearchEventCounters,
+    elapsed_ms: u64,
+    max_depth_reached: u32,
 }
 
 impl MCTSEngine {
@@ -72,6 +78,9 @@ impl MCTSEngine {
             transpositions: HashMap::new(),
             rng,
             iterations_performed: 0,
+            counters: SearchEventCounters::default(),
+            elapsed_ms: 0,
+            max_depth_reached: 0,
         }
     }
 
@@ -81,6 +90,9 @@ impl MCTSEngine {
         self.nodes.clear();
         self.transpositions.clear();
         self.iterations_performed = 0;
+        self.counters = SearchEventCounters::default();
+        self.elapsed_ms = 0;
+        self.max_depth_reached = 0;
 
         let legal = generate_legal_moves(bb);
         if legal.is_empty() {
@@ -106,12 +118,17 @@ impl MCTSEngine {
             is_terminal,
             terminal_value,
         });
+        self.counters.expanded_nodes += 1;
+        if is_terminal {
+            self.counters.terminal_hits += 1;
+        }
 
         let deadline = self
             .config
             .time_limit_s
             .map(|s| Instant::now() + std::time::Duration::from_secs_f64(s));
 
+        let started = Instant::now();
         for _ in 0..self.config.max_iterations {
             let mut path = self.select(0);
             let leaf = *path.last().expect("path always contains the root");
@@ -119,6 +136,7 @@ impl MCTSEngine {
             if expanded != leaf {
                 path.push(expanded);
             }
+            self.max_depth_reached = self.max_depth_reached.max(path.len() as u32 - 1);
             let value = self.simulate(expanded);
             self.backpropagate(&path, value);
             self.iterations_performed += 1;
@@ -129,6 +147,7 @@ impl MCTSEngine {
                 }
             }
         }
+        self.elapsed_ms = started.elapsed().as_millis() as u64;
 
         self.best_move(bb)
     }
@@ -226,6 +245,7 @@ impl MCTSEngine {
         let mv = self.nodes[node_id].untried_moves.swap_remove(idx);
         let parent_bb = self.nodes[node_id].bb;
         let new_bb = apply_move(&parent_bb, &mv);
+        self.counters.generated_nodes += 1;
 
         if self.config.use_transposition_table {
             let key = State::new(new_bb).canonical_key();
@@ -233,6 +253,7 @@ impl MCTSEngine {
                 if !self.nodes[node_id].children.contains(&existing) {
                     self.nodes[node_id].children.push(existing);
                 }
+                self.counters.transposition_hits += 1;
                 return existing;
             }
         }
@@ -253,6 +274,10 @@ impl MCTSEngine {
             }
             WinStatus::NoWin => 0.0,
         };
+        self.counters.expanded_nodes += 1;
+        if is_terminal {
+            self.counters.terminal_hits += 1;
+        }
 
         let child_id = self.nodes.len();
         self.nodes.push(MCTSNode {
@@ -364,12 +389,128 @@ impl MCTSEngine {
     pub fn nodes_created(&self) -> usize {
         self.nodes.len()
     }
+
+    /// Telemetry for the most recent `search()` call; `None` whenever the
+    /// root has no expanded children — `search` has not run, the root was
+    /// terminal or had no legal moves, or the iteration budget was
+    /// exhausted before any child was expanded (e.g. `max_iterations`
+    /// of 0). See the `search_telemetry` module docs for the normative
+    /// counter semantics.
+    pub fn telemetry(&self) -> Option<SearchTelemetry> {
+        let root = self.nodes.first()?;
+        if root.children.is_empty() {
+            return None;
+        }
+        let root_bb = root.bb;
+        let mover = current_player(&root_bb).unwrap_or(0);
+        // A terminal child is a PROVEN result: its value is derived directly
+        // from `terminal_value` (P0-perspective) rather than sampled, so it
+        // is reported as exact ±1 from the root mover's perspective. A
+        // non-terminal child's value is a rollout-sampled win rate and must
+        // never collide with the proven-exclusive ±1.0, hence
+        // `clamp_unproven`. See the `search_telemetry` module docs' value
+        // invariant.
+        let q_of = |node: &MCTSNode| -> Option<f64> {
+            if node.is_terminal {
+                let value = if mover == 0 {
+                    node.terminal_value
+                } else {
+                    -node.terminal_value
+                };
+                return Some(value);
+            }
+            if node.visit_count == 0 {
+                return None;
+            }
+            let wins = if mover == 0 {
+                node.win_count_p0
+            } else {
+                node.win_count_p1
+            };
+            Some(clamp_unproven(
+                2.0 * (wins as f64 / node.visit_count as f64) - 1.0,
+            ))
+        };
+        let root_moves: Vec<RootMoveStat> = root
+            .children
+            .iter()
+            .map(|&idx| {
+                let child = &self.nodes[idx];
+                RootMoveStat::new(
+                    child.mv.expect("child node always has a move"),
+                    child.visit_count as u64,
+                    q_of(child),
+                )
+            })
+            .collect();
+        let (_, win_rate) = self.best_move(&root_bb)?;
+        // Mirror `best_move`'s tie-break (first child with strictly more
+        // visits) to find the same best child, so `root_value` can apply
+        // the same proven/unproven rule as `q_of` above.
+        let mut best_visits = 0u32;
+        let mut best_child_id = root.children[0];
+        for &child_id in &root.children {
+            if self.nodes[child_id].visit_count > best_visits {
+                best_visits = self.nodes[child_id].visit_count;
+                best_child_id = child_id;
+            }
+        }
+        let best_child = &self.nodes[best_child_id];
+        let root_value = if best_child.is_terminal {
+            if mover == 0 {
+                best_child.terminal_value
+            } else {
+                -best_child.terminal_value
+            }
+        } else {
+            clamp_unproven(2.0 * win_rate - 1.0)
+        };
+        Some(SearchTelemetry {
+            engine_kind: EngineKind::Mcts,
+            root_value,
+            policy_mass_kind: PolicyMassKind::Visits,
+            root_moves,
+            root_identity_preserved: !self.config.use_transposition_table,
+            principal_variation: self.principal_variation(),
+            counters: self.counters,
+            elapsed_ms: self.elapsed_ms,
+            depth_reached: self.max_depth_reached,
+            seed: self.config.seed,
+        })
+    }
+
+    /// Max-visit descent from the root; ties break on the lowest
+    /// `action_index` for determinism. Bounded by 16 plies (a full game).
+    fn principal_variation(&self) -> Vec<Move> {
+        let mut pv = Vec::new();
+        let mut node_id = 0usize;
+        for _ in 0..16 {
+            let node = &self.nodes[node_id];
+            let best = node
+                .children
+                .iter()
+                .filter(|&&c| self.nodes[c].visit_count > 0)
+                .min_by_key(|&&c| {
+                    let child = &self.nodes[c];
+                    let mv = child.mv.expect("child node always has a move");
+                    (
+                        std::cmp::Reverse(child.visit_count),
+                        mv.shape * 16 + mv.position,
+                    )
+                });
+            let Some(&best) = best else { break };
+            pv.push(self.nodes[best].mv.expect("child node always has a move"));
+            node_id = best;
+        }
+        pv
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::game::has_winning_line;
+    use crate::search_telemetry::UNPROVEN_VALUE_BOUND;
 
     #[test]
     fn mcts_returns_a_move() {
@@ -544,6 +685,64 @@ mod tests {
         assert!(prob > 0.5, "win probability is for the root mover");
     }
 
+    /// FIX 1 (value invariant): a root child that immediately wins the game
+    /// is a PROVEN result and must report an exact `q_value` of `1.0` (and
+    /// drive an exact `root_value` of `1.0`), while every other, merely
+    /// sampled root move stays within `UNPROVEN_VALUE_BOUND` — proving the
+    /// terminal-child conversion in `MCTSEngine::telemetry` end to end,
+    /// rather than only unit-testing the arithmetic in isolation.
+    #[test]
+    fn telemetry_proven_terminal_child_is_exact_others_are_clamped() {
+        // Same position as `mcts_picks_immediate_win_for_player_1`: A@0,
+        // b@1, C@2, p1 to move, d@3 completes row 0 and wins for p1. No
+        // other legal move at this position touches a line one move from
+        // completion, so it is the only root move whose child is terminal.
+        let bb = Bitboard::EMPTY
+            .with_move(0, 0, 0)
+            .with_move(1, 1, 1)
+            .with_move(0, 2, 2);
+        let winning_move = Move::new(1, 3, 3);
+        let mut engine = MCTSEngine::new(MCTSConfig {
+            max_iterations: 3_000,
+            seed: Some(7),
+            use_transposition_table: false,
+            ..Default::default()
+        });
+        engine.search(&bb).unwrap();
+        let t = engine.telemetry().unwrap();
+
+        let winning_stat = t
+            .root_moves
+            .iter()
+            .find(|s| s.mv == winning_move)
+            .expect("the winning move is legal here and must be a root move");
+        assert_eq!(
+            winning_stat.q_value,
+            Some(1.0),
+            "a proven (terminal) root child must report exact q_value 1.0, got {:?}",
+            winning_stat.q_value
+        );
+
+        for stat in &t.root_moves {
+            if stat.mv == winning_move {
+                continue;
+            }
+            if let Some(q) = stat.q_value {
+                assert!(
+                    q.abs() <= UNPROVEN_VALUE_BOUND,
+                    "non-terminal root move {:?} must respect UNPROVEN_VALUE_BOUND, got q={q}",
+                    stat.mv
+                );
+            }
+        }
+
+        assert_eq!(
+            t.root_value, 1.0,
+            "the terminal winning child is also the best (most-visited) \
+             child here, so root_value must be the same exact proven 1.0"
+        );
+    }
+
     #[test]
     fn time_limit_stops_early() {
         let mut engine = MCTSEngine::new(MCTSConfig {
@@ -596,5 +795,100 @@ mod tests {
             time_limit_s: Some(0.0),
             ..Default::default()
         });
+    }
+
+    #[test]
+    fn telemetry_none_before_search() {
+        let engine = MCTSEngine::new(MCTSConfig::default());
+        assert!(engine.telemetry().is_none());
+    }
+
+    #[test]
+    fn telemetry_tt_on_empty_board_collapses_and_flags_identity() {
+        let mut engine = MCTSEngine::new(MCTSConfig {
+            max_iterations: 200,
+            seed: Some(11),
+            ..Default::default()
+        });
+        engine.search(&Bitboard::EMPTY).unwrap();
+        let t = engine.telemetry().unwrap();
+        assert!(!t.root_identity_preserved);
+        // The documented collapse: 64 legal first moves, 3 canonical children.
+        assert!(t.root_moves.len() < 64);
+        assert!(t.counters.transposition_hits > 0);
+    }
+
+    #[test]
+    fn telemetry_tt_off_preserves_identity_and_invariants() {
+        let mut engine = MCTSEngine::new(MCTSConfig {
+            max_iterations: 500,
+            seed: Some(11),
+            use_transposition_table: false,
+            ..Default::default()
+        });
+        let (best, _) = engine.search(&Bitboard::EMPTY).unwrap();
+        let t = engine.telemetry().unwrap();
+        assert!(t.root_identity_preserved);
+        assert_eq!(t.policy_mass_kind, PolicyMassKind::Visits);
+        assert_eq!(t.engine_kind, EngineKind::Mcts);
+        assert_eq!(t.counters.transposition_hits, 0);
+        assert!(t.counters.expanded_nodes > 0);
+        assert!(t.counters.generated_nodes >= t.counters.expanded_nodes - 1);
+        // Mass lands only on legal root actions and every q is in range. No
+        // Quantik game ends before ply 7 (see `rollout_terminals_are_
+        // excluded_from_terminal_hits` below), so every depth-1 root child
+        // here is necessarily non-terminal/unproven: q must respect the
+        // tighter `UNPROVEN_VALUE_BOUND`, never the proven-exclusive ±1.0,
+        // even though every rollout backing it may have agreed.
+        let legal: std::collections::HashSet<u8> = generate_legal_moves(&Bitboard::EMPTY)
+            .iter()
+            .map(|m| m.shape * 16 + m.position)
+            .collect();
+        for stat in &t.root_moves {
+            assert!(legal.contains(&stat.action_index));
+            if let Some(q) = stat.q_value {
+                assert!(
+                    q.abs() <= UNPROVEN_VALUE_BOUND,
+                    "depth-1 root child is unproven and must respect \
+                     UNPROVEN_VALUE_BOUND, got q={q}"
+                );
+            }
+        }
+        assert!(t.root_value.abs() <= UNPROVEN_VALUE_BOUND);
+        // PV starts with the best move and is a legal line from the root.
+        assert_eq!(t.principal_variation.first(), Some(&best));
+        let mut bb = Bitboard::EMPTY;
+        for mv in &t.principal_variation {
+            assert!(generate_legal_moves(&bb).contains(mv));
+            bb = apply_move(&bb, mv);
+        }
+        // depth_reached must count the expanded leaf, not just the
+        // selection path up to it (FIX 2): with 500 iterations against the
+        // empty board's branching factor, the tree grows well past depth 1.
+        assert!(
+            t.depth_reached as usize >= t.principal_variation.len().min(1),
+            "depth_reached ({}) must be at least as deep as the PV implies",
+            t.depth_reached
+        );
+        assert!(
+            t.depth_reached >= 2,
+            "expanded leaf must count toward depth_reached, got {}",
+            t.depth_reached
+        );
+    }
+
+    #[test]
+    fn rollout_terminals_are_excluded_from_terminal_hits() {
+        // 3 iterations: the tree cannot reach a terminal at depth <= 3 (no
+        // Quantik game ends before ply 7), but every rollout finishes a game.
+        let mut engine = MCTSEngine::new(MCTSConfig {
+            max_iterations: 3,
+            seed: Some(5),
+            use_transposition_table: false,
+            ..Default::default()
+        });
+        engine.search(&Bitboard::EMPTY).unwrap();
+        let t = engine.telemetry().unwrap();
+        assert_eq!(t.counters.terminal_hits, 0);
     }
 }

@@ -29,6 +29,9 @@ use crate::bitboard::Bitboard;
 use crate::evaluation::{evaluate, EvalConfig};
 use crate::game::{current_player, has_winning_line};
 use crate::moves::{apply_move, generate_legal_moves, Move};
+use crate::search_telemetry::{
+    EngineKind, PolicyMassKind, RootMoveStat, SearchEventCounters, SearchTelemetry,
+};
 use crate::state::State;
 use rand::prelude::*;
 use std::collections::HashMap;
@@ -92,6 +95,19 @@ fn move_sort_key(mv: &Move) -> (u8, u8) {
     (mv.shape, mv.position)
 }
 
+/// Map a root-perspective minimax score onto the telemetry value scale.
+/// Proven results (mate scores, `|score| >= win - 16`) map to exactly
+/// `±1.0`; heuristic scores squash smoothly into `(-1, 1)`.
+pub(crate) fn minimax_q_from_score(score: f64, win: f64) -> f64 {
+    if score >= win - 16.0 {
+        1.0
+    } else if score <= -(win - 16.0) {
+        -1.0
+    } else {
+        score / (1.0 + score.abs())
+    }
+}
+
 /// Alpha-beta negamax search engine over the exact Quantik game tree.
 pub struct MinimaxEngine {
     pub config: MinimaxConfig,
@@ -100,6 +116,16 @@ pub struct MinimaxEngine {
     deadline: Option<Instant>,
     rng: Option<StdRng>,
     pv_hint: Vec<Move>,
+    counters: SearchEventCounters,
+    /// Root moves paired with their negamax score, from the deepest
+    /// completed `search_root` iteration. Empty until a search completes;
+    /// used both as the telemetry root-move source and as the "has a
+    /// search run" sentinel for [`Self::telemetry`].
+    last_root_scored: Vec<(Move, f64)>,
+    last_pv: Vec<Move>,
+    last_elapsed_ms: u64,
+    last_depth: u32,
+    last_root_value: f64,
 }
 
 impl MinimaxEngine {
@@ -112,6 +138,12 @@ impl MinimaxEngine {
             deadline: None,
             rng,
             pv_hint: Vec::new(),
+            counters: SearchEventCounters::default(),
+            last_root_scored: Vec::new(),
+            last_pv: Vec::new(),
+            last_elapsed_ms: 0,
+            last_depth: 0,
+            last_root_value: 0.0,
         }
     }
 
@@ -139,6 +171,12 @@ impl MinimaxEngine {
     pub fn search(&mut self, state: &State) -> Result<MinimaxResult, String> {
         let start = Instant::now();
         self.nodes = 0;
+        self.counters = SearchEventCounters::default();
+        self.last_root_scored = Vec::new();
+        self.last_pv = Vec::new();
+        self.last_elapsed_ms = 0;
+        self.last_depth = 0;
+        self.last_root_value = 0.0;
         self.tt.clear();
         self.pv_hint.clear();
         self.deadline = self
@@ -157,6 +195,9 @@ impl MinimaxEngine {
             match self.search_root(&bb, &root_moves, depth) {
                 Ok((score, best_move, pv)) => {
                     self.pv_hint = pv.clone();
+                    self.last_pv = pv.clone();
+                    self.last_depth = depth;
+                    self.last_root_value = score;
                     result = Some(MinimaxResult {
                         best_move,
                         score,
@@ -180,7 +221,38 @@ impl MinimaxEngine {
         // reachable position; mirror the Python assertion.
         let mut result = result.expect("depth-1 iteration always completes");
         result.elapsed = start.elapsed().as_secs_f64();
+        // Derive from the same (already-final) elapsed value written into
+        // the returned result, so telemetry's elapsed_ms always matches
+        // exactly what the caller sees on `result.elapsed`.
+        self.last_elapsed_ms = (result.elapsed * 1000.0).round() as u64;
         Ok(result)
+    }
+
+    /// Telemetry for the most recent completed `search()`/`solve()`;
+    /// `None` before the first search. See the `search_telemetry` module
+    /// docs for the normative counter semantics.
+    pub fn telemetry(&self) -> Option<SearchTelemetry> {
+        if self.last_root_scored.is_empty() {
+            return None;
+        }
+        let win = self.config.eval_config.win;
+        let root_moves = self
+            .last_root_scored
+            .iter()
+            .map(|&(mv, score)| RootMoveStat::new(mv, 0, Some(minimax_q_from_score(score, win))))
+            .collect();
+        Some(SearchTelemetry {
+            engine_kind: EngineKind::Minimax,
+            root_value: minimax_q_from_score(self.last_root_value, win),
+            policy_mass_kind: PolicyMassKind::None,
+            root_moves,
+            root_identity_preserved: !self.config.dedup_children,
+            principal_variation: self.last_pv.clone(),
+            counters: self.counters,
+            elapsed_ms: self.last_elapsed_ms,
+            depth_reached: self.last_depth,
+            seed: self.config.random_seed,
+        })
     }
 
     // ----- internals -----------------------------------------------------
@@ -207,7 +279,15 @@ impl MinimaxEngine {
     /// `State::canonical_key()` collapse onto a single representative (the
     /// first survivor in `moves`' order, preserving the lowest
     /// `(shape, position)` tie-break).
-    fn children(bb: &Bitboard, moves: &[Move], dedup: bool) -> Vec<ChildEntry> {
+    ///
+    /// Counts one `expanded_nodes` per invocation (this is the "a state's
+    /// successor set was computed" event for both the root call in
+    /// `search_root` and every recursive call in `negamax`), `generated_nodes`
+    /// for every move applied (before dedup filtering), and
+    /// `canonical_dedup_hits` for each sibling collapsed by dedup.
+    fn children(&mut self, bb: &Bitboard, moves: &[Move], dedup: bool) -> Vec<ChildEntry> {
+        self.counters.expanded_nodes += 1;
+        self.counters.generated_nodes += moves.len() as u64;
         if !dedup {
             return moves
                 .iter()
@@ -220,6 +300,7 @@ impl MinimaxEngine {
             let child_bb = apply_move(bb, &mv);
             let key = State::new(child_bb).canonical_key();
             if seen.insert(key, ()).is_some() {
+                self.counters.canonical_dedup_hits += 1;
                 continue;
             }
             children.push((mv, child_bb, Some(key)));
@@ -242,7 +323,8 @@ impl MinimaxEngine {
         depth: u32,
     ) -> Result<(f64, Move, Vec<Move>), TimeUp> {
         let ordered = self.order_root_moves(moves);
-        let children = Self::children(bb, &ordered, self.config.dedup_children);
+        let dedup = self.config.dedup_children;
+        let children = self.children(bb, &ordered, dedup);
 
         let mut best_value = f64::NEG_INFINITY;
         let mut scored: Vec<(Move, f64, Vec<Move>)> = Vec::with_capacity(children.len());
@@ -272,6 +354,11 @@ impl MinimaxEngine {
         };
         let mut pv = vec![*mv];
         pv.extend(child_pv.iter().copied());
+        // Written at the end of the deepest COMPLETED iteration only: a
+        // `search()` loop that breaks on TimeUp mid-iteration never reaches
+        // this line for that iteration, so `last_root_scored` (and thus
+        // `telemetry()`) always reflects the previous, fully-scored depth.
+        self.last_root_scored = scored.iter().map(|(m, v, _)| (*m, *v)).collect();
         Ok((best_value, *mv, pv))
     }
 
@@ -313,12 +400,14 @@ impl MinimaxEngine {
             // The previous mover completed a line: the side to move here has
             // just lost. `ply` makes a sooner loss/win score more extremely
             // than a deeper one (shallower mates score higher).
+            self.counters.terminal_hits += 1;
             return Ok(-(win - ply as f64));
         }
 
         let moves = generate_legal_moves(bb);
         if moves.is_empty() {
             // No legal moves: the side to move also loses.
+            self.counters.terminal_hits += 1;
             return Ok(-(win - ply as f64));
         }
 
@@ -336,6 +425,7 @@ impl MinimaxEngine {
             if let Some(&(stored_depth, stored_value, bound)) = self.tt.get(&key) {
                 if stored_depth >= depth {
                     if bound == Bound::Exact {
+                        self.counters.transposition_hits += 1;
                         return Ok(stored_value);
                     }
                     // LOWER/UPPER entries only narrow the window when
@@ -349,6 +439,7 @@ impl MinimaxEngine {
                             Bound::Exact => unreachable!(),
                         }
                         if alpha >= beta {
+                            self.counters.transposition_hits += 1;
                             return Ok(stored_value);
                         }
                     }
@@ -358,7 +449,8 @@ impl MinimaxEngine {
 
         let mut ordered = moves;
         ordered.sort_by_key(move_sort_key);
-        let mut children = Self::children(bb, &ordered, self.config.dedup_children);
+        let dedup = self.config.dedup_children;
+        let mut children = self.children(bb, &ordered, dedup);
         // Move ordering: try immediate winning replies first — a move that
         // completes a line makes this node a forced win, so exploring it
         // first yields the earliest possible beta cutoff. Stable, so the
@@ -563,5 +655,79 @@ mod tests {
             assert!(winning.contains(&result.best_move));
             assert_eq!(result.score, 10_000.0 - 1.0);
         }
+    }
+
+    #[test]
+    fn q_mapping_proven_and_heuristic() {
+        let win = 10_000.0;
+        assert_eq!(minimax_q_from_score(win - 7.0, win), 1.0);
+        assert_eq!(minimax_q_from_score(-(win - 7.0), win), -1.0);
+        let q = minimax_q_from_score(3.0, win);
+        assert!(q > 0.0 && q < 1.0);
+        let q_neg = minimax_q_from_score(-3.0, win);
+        assert!((q + q_neg).abs() < 1e-12); // odd symmetry
+        assert!(minimax_q_from_score(5.0, win) > minimax_q_from_score(3.0, win));
+    }
+
+    #[test]
+    fn minimax_telemetry_dedup_and_identity() {
+        let mut engine = MinimaxEngine::new(MinimaxConfig {
+            max_depth: 3,
+            ..Default::default()
+        });
+        engine.search(&State::new(Bitboard::EMPTY)).unwrap();
+        let t = engine.telemetry().unwrap();
+        assert!(!t.root_identity_preserved); // dedup_children defaults to true
+        assert!(t.counters.canonical_dedup_hits > 0);
+        assert_eq!(t.engine_kind, EngineKind::Minimax);
+        assert_eq!(t.policy_mass_kind, PolicyMassKind::None);
+        for stat in &t.root_moves {
+            assert_eq!(stat.policy_mass, 0);
+            let q = stat
+                .q_value
+                .expect("minimax scores every searched root move");
+            assert!((-1.0..=1.0).contains(&q));
+        }
+    }
+
+    #[test]
+    fn minimax_transposition_hits_require_tt() {
+        // Depth >= 4 from a quiet position revisits transposed states.
+        let state = State::new(Bitboard::EMPTY);
+        let mut with_tt = MinimaxEngine::new(MinimaxConfig {
+            max_depth: 4,
+            dedup_children: false,
+            ..Default::default()
+        });
+        with_tt.search(&state).unwrap();
+        let hits_with = with_tt.telemetry().unwrap().counters.transposition_hits;
+        let mut without_tt = MinimaxEngine::new(MinimaxConfig {
+            max_depth: 4,
+            dedup_children: false,
+            use_transposition_table: false,
+            ..Default::default()
+        });
+        without_tt.search(&state).unwrap();
+        let hits_without = without_tt.telemetry().unwrap().counters.transposition_hits;
+        assert!(hits_with > 0);
+        assert_eq!(hits_without, 0);
+        // Identity is preserved without dedup.
+        assert!(without_tt.telemetry().unwrap().root_identity_preserved);
+    }
+
+    #[test]
+    fn minimax_telemetry_pv_matches_result() {
+        let mut engine = MinimaxEngine::new(MinimaxConfig {
+            max_depth: 3,
+            ..Default::default()
+        });
+        let result = engine.search(&State::new(Bitboard::EMPTY)).unwrap();
+        let t = engine.telemetry().unwrap();
+        assert_eq!(t.principal_variation, result.pv);
+        assert_eq!(t.depth_reached, result.depth_reached);
+        assert!((-1.0..=1.0).contains(&t.root_value));
+        // No Quantik game ends before ply 7, so a depth-3 tree has no terminals.
+        assert_eq!(t.counters.terminal_hits, 0);
+        assert!(t.counters.expanded_nodes > 0);
     }
 }

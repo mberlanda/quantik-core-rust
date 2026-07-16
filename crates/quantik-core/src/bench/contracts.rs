@@ -10,6 +10,7 @@ use crate::bitboard::Bitboard;
 use crate::constants::{MAX_PIECES_PER_SHAPE, WIN_MASKS};
 use crate::game::current_player;
 use crate::moves::generate_legal_moves;
+use crate::search_telemetry::SearchTelemetry;
 use crate::state::State;
 use serde_json::{json, Value};
 #[cfg(feature = "arrow-parquet")]
@@ -27,12 +28,17 @@ pub const MODEL_CHECKPOINT_CONTRACT_VERSION: &str = "1.1.0";
 pub const SELFPLAY_CONTRACT_VERSION: &str = "1.1.0";
 pub const OBSERVATION_CONTRACT_VERSION: &str = "1.1.0";
 pub const GAME_RESULT_CONTRACT_VERSION: &str = "1.1.0";
+pub const SEARCH_SUMMARY_CONTRACT_VERSION: &str = "1.1.0";
 pub const SELFPLAY_SCHEMA: &str = "selfplay.v1";
 pub const ARROW_PARQUET_SELFPLAY_SCHEMA: &str = "arrow-parquet-selfplay.v1";
 pub const OPENING_BOOK_SCHEMA: &str = "opening-book.v1";
 pub const OBSERVATION_SCHEMA: &str = "observation.v1";
 pub const GAME_RESULT_SCHEMA: &str = "game-result.v1";
 pub const MODEL_CHECKPOINT_SCHEMA: &str = "model-checkpoint.v1";
+/// Draft, unstable schema for per-search-call telemetry rows. Not part of
+/// `SUPPORTED_MODEL_INPUT_CONTRACTS` — this is a draft surface, not a
+/// stabilized cross-repository contract.
+pub const SEARCH_SUMMARY_DRAFT_SCHEMA: &str = "search-summary.v1-draft";
 
 const SUPPORTED_MODEL_INPUT_CONTRACTS: &[&str] = &[
     "qfen.v1",
@@ -2073,6 +2079,95 @@ pub fn observation_v1_row(
     }))
 }
 
+/// Engine run configuration echoed into a `search-summary.v1-draft` row;
+/// `None` fields map to JSON `null`.
+pub struct SearchSummaryRunConfig<'a> {
+    pub config_label: &'a str,
+    pub search_depth: Option<u32>,
+    pub rollouts: Option<u64>,
+    pub beam_width: Option<u64>,
+    pub node_budget: Option<u64>,
+    pub time_budget_ms: Option<u64>,
+}
+
+/// One draft `search-summary.v1-draft` row for a single completed root
+/// search, or `Ok(None)` when `telemetry.root_identity_preserved` is
+/// false — such rows are skipped, per the design spec's Root Identity
+/// section, since canonical/transposition merging may have collapsed
+/// distinct root moves onto shared statistics.
+pub fn search_summary_row(
+    row_id: u64,
+    run_id: &str,
+    qfen: &str,
+    telemetry: &SearchTelemetry,
+    run_config: &SearchSummaryRunConfig,
+) -> Result<Option<Value>, String> {
+    if !telemetry.root_identity_preserved {
+        return Ok(None);
+    }
+
+    let state = State::from_qfen(qfen)?;
+    let bb = state.bb;
+    let side_to_move = current_player(&bb).ok_or("inconsistent side to move")?;
+
+    let mut policy_visits = vec![0u64; 64];
+    let mut root_q_values = vec![Value::Null; 64];
+    for stat in &telemetry.root_moves {
+        let idx = stat.action_index as usize;
+        if idx >= 64 {
+            return Err(format!(
+                "root move action_index {idx} out of range (must be < 64)"
+            ));
+        }
+        policy_visits[idx] = stat.policy_mass;
+        if let Some(q) = stat.q_value {
+            root_q_values[idx] = json!(q);
+        }
+    }
+
+    let principal_variation: Vec<u8> = telemetry
+        .principal_variation
+        .iter()
+        .map(|mv| action_index(mv.shape, mv.position))
+        .collect();
+
+    Ok(Some(json!({
+        "schema": SEARCH_SUMMARY_DRAFT_SCHEMA,
+        "contract_version": SEARCH_SUMMARY_CONTRACT_VERSION,
+        "run_id": run_id,
+        "row_id": row_id,
+        "position_key": canonical_key_hex(&state),
+        "ply": bb.player_piece_count(0) + bb.player_piece_count(1),
+        "side_to_move": side_to_move,
+        "bitboards": bb.planes,
+        "qfen": qfen,
+        "legal_action_mask": legal_action_mask(&bb),
+        "engine_kind": telemetry.engine_kind.as_str(),
+        "engine_version": env!("CARGO_PKG_VERSION"),
+        "engine_checkpoint": Value::Null,
+        "config_label": run_config.config_label,
+        "search_depth": run_config.search_depth,
+        "rollouts": run_config.rollouts,
+        "beam_width": run_config.beam_width,
+        "node_budget": run_config.node_budget,
+        "time_budget_ms": run_config.time_budget_ms,
+        "seed": telemetry.seed,
+        "root_value": telemetry.root_value,
+        "policy_mass_kind": telemetry.policy_mass_kind.as_str(),
+        "policy_visits": policy_visits,
+        "root_q_values": root_q_values,
+        "principal_variation": principal_variation,
+        "expanded_nodes": telemetry.counters.expanded_nodes,
+        "generated_nodes": telemetry.counters.generated_nodes,
+        "transposition_hits": telemetry.counters.transposition_hits,
+        "canonical_dedup_hits": telemetry.counters.canonical_dedup_hits,
+        "terminal_hits": telemetry.counters.terminal_hits,
+        "tablebase_hits": telemetry.counters.tablebase_hits,
+        "elapsed_ms": telemetry.elapsed_ms,
+        "depth_reached": telemetry.depth_reached,
+    })))
+}
+
 pub fn game_result_v1_row(
     row_id: u64,
     run_id: &str,
@@ -2210,6 +2305,64 @@ mod tests {
     #[test]
     fn legal_mask_empty_board_covers_all_actions() {
         assert_eq!(legal_action_mask(&Bitboard::EMPTY), u64::MAX);
+    }
+
+    #[test]
+    fn search_summary_row_shape_and_mask_consistency() {
+        let empty_qfen = State::new(Bitboard::EMPTY).to_qfen();
+        let mut engine = crate::mcts::MCTSEngine::new(crate::mcts::MCTSConfig {
+            max_iterations: 50,
+            seed: Some(7),
+            use_transposition_table: false,
+            ..Default::default()
+        });
+        engine.search(&Bitboard::EMPTY).unwrap();
+        let telemetry = engine.telemetry().unwrap();
+        let run_config = SearchSummaryRunConfig {
+            config_label: "test-mcts",
+            search_depth: None,
+            rollouts: Some(50),
+            beam_width: None,
+            node_budget: None,
+            time_budget_ms: None,
+        };
+        let row = search_summary_row(0, "run-test", &empty_qfen, &telemetry, &run_config)
+            .unwrap()
+            .expect("identity preserved rows are emitted");
+        assert_eq!(row["schema"], SEARCH_SUMMARY_DRAFT_SCHEMA);
+        assert_eq!(row["engine_kind"], "mcts");
+        assert_eq!(row["policy_visits"].as_array().unwrap().len(), 64);
+        assert_eq!(row["root_q_values"].as_array().unwrap().len(), 64);
+        // Mass only on legal actions.
+        let mask = row["legal_action_mask"].as_u64().unwrap();
+        for (i, v) in row["policy_visits"].as_array().unwrap().iter().enumerate() {
+            if v.as_u64().unwrap() > 0 {
+                assert!(mask & (1u64 << i) != 0);
+            }
+        }
+        assert!(row["expanded_nodes"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn search_summary_row_skips_unpreserved_identity() {
+        let empty_qfen = State::new(Bitboard::EMPTY).to_qfen();
+        let mut engine = crate::mcts::MCTSEngine::new(crate::mcts::MCTSConfig {
+            max_iterations: 50,
+            seed: Some(7),
+            ..Default::default() // TT on -> identity not preserved
+        });
+        engine.search(&Bitboard::EMPTY).unwrap();
+        let telemetry = engine.telemetry().unwrap();
+        let run_config = SearchSummaryRunConfig {
+            config_label: "test-mcts-tt",
+            search_depth: None,
+            rollouts: Some(50),
+            beam_width: None,
+            node_budget: None,
+            time_budget_ms: None,
+        };
+        let row = search_summary_row(0, "run-test", &empty_qfen, &telemetry, &run_config).unwrap();
+        assert!(row.is_none());
     }
 
     #[test]

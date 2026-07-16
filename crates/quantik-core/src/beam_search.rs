@@ -13,6 +13,9 @@
 use crate::bitboard::Bitboard;
 use crate::game::{check_winner, current_player, WinStatus};
 use crate::moves::{apply_move, generate_legal_moves, Move};
+use crate::search_telemetry::{
+    clamp_unproven, EngineKind, PolicyMassKind, RootMoveStat, SearchEventCounters, SearchTelemetry,
+};
 use crate::symmetry::SymmetryHandler;
 use rand::prelude::*;
 use std::collections::HashMap;
@@ -250,6 +253,11 @@ pub struct BeamSearchEngine {
     pub config: BeamSearchConfig,
     rng: StdRng,
     evaluator: Option<Evaluator>,
+    counters: SearchEventCounters,
+    /// Canonical dedup hits observed at depth 1 only. `search_telemetry`'s
+    /// `root_identity_preserved` is `true` iff this stays 0.
+    root_dedup_hits: u64,
+    elapsed_ms: u64,
 }
 
 impl BeamSearchEngine {
@@ -295,6 +303,9 @@ impl BeamSearchEngine {
             config,
             rng,
             evaluator: None,
+            counters: SearchEventCounters::default(),
+            root_dedup_hits: 0,
+            elapsed_ms: 0,
         })
     }
 
@@ -306,6 +317,11 @@ impl BeamSearchEngine {
 
     /// Run beam search from `root`.
     pub fn search(&mut self, root: &Bitboard) -> Result<BeamSearchResult, String> {
+        let started = Instant::now();
+        self.counters = SearchEventCounters::default();
+        self.root_dedup_hits = 0;
+        self.elapsed_ms = 0;
+
         if check_winner(root) != WinStatus::NoWin {
             return Err("Cannot search from an already-terminal root state.".into());
         }
@@ -383,6 +399,8 @@ impl BeamSearchEngine {
             .cloned();
         terminal_leaves.sort_by(|a, b| root_perspective(b).total_cmp(&root_perspective(a)));
 
+        self.elapsed_ms = started.elapsed().as_millis() as u64;
+
         Ok(BeamSearchResult {
             best_leaf,
             terminal_leaves,
@@ -392,6 +410,76 @@ impl BeamSearchEngine {
             root_player,
             frontier_leaves,
         })
+    }
+
+    /// Telemetry for `result` (from this engine's most recent `search`).
+    /// Root data derives from `ranked_root_moves(None)`; counters and
+    /// elapsed come from that run.
+    ///
+    /// Precondition: `result` MUST be the value returned by the most
+    /// recent `search` call on this same engine instance. Root moves and
+    /// the principal variation come from `result` while counters and
+    /// `elapsed_ms` live on the engine, so pairing a result from an
+    /// earlier run or another instance yields silently inconsistent
+    /// telemetry. See the `search_telemetry` module docs for the
+    /// normative counter semantics.
+    pub fn telemetry(&self, result: &BeamSearchResult) -> SearchTelemetry {
+        let ranked = result.ranked_root_moves(None);
+        // `has_terminal_win` proves `best_value == 1.0` only (a root-player
+        // win, `root_perspective(leaf) == 1.0`, on some supporting leaf); it
+        // says nothing about a proven loss. `RankedRootMove` has no
+        // "terminal at best_value" flag for the loss side, so a proven loss
+        // that collapses to `best_value == -1.0` is indistinguishable here
+        // from a sampled -1.0 and is conservatively passed through
+        // `clamp_unproven` — see the `search_telemetry` module docs' value
+        // invariant for this documented exception.
+        let root_moves: Vec<RootMoveStat> = ranked
+            .iter()
+            .map(|r| {
+                let q = if r.has_terminal_win && r.best_value >= 1.0 {
+                    1.0
+                } else {
+                    clamp_unproven(r.best_value)
+                };
+                RootMoveStat::new(r.mv, r.total_multiplicity, Some(q))
+            })
+            .collect();
+        let root_value = result
+            .best_leaf
+            .as_ref()
+            .map(|leaf| {
+                let v = if result.root_player == 0 {
+                    leaf.value
+                } else {
+                    -leaf.value
+                };
+                // A terminal best leaf is a PROVEN result (its value is
+                // exactly ±1.0 by construction, see `BeamLeaf::value`'s
+                // doc); a non-terminal best leaf is a sampled/heuristic
+                // estimate and must stay inside the unproven bound.
+                if leaf.is_terminal {
+                    v
+                } else {
+                    clamp_unproven(v)
+                }
+            })
+            .unwrap_or(0.0);
+        SearchTelemetry {
+            engine_kind: EngineKind::Beam,
+            root_value,
+            policy_mass_kind: PolicyMassKind::Multiplicity,
+            root_moves,
+            root_identity_preserved: self.root_dedup_hits == 0,
+            principal_variation: result
+                .best_leaf
+                .as_ref()
+                .map(|l| l.moves.clone())
+                .unwrap_or_default(),
+            counters: self.counters,
+            elapsed_ms: self.elapsed_ms,
+            depth_reached: result.max_depth_reached,
+            seed: self.config.random_seed,
+        }
     }
 
     /// Resolve the beam width to use at a given depth (1-indexed).
@@ -434,11 +522,13 @@ impl BeamSearchEngine {
         let mut index_by_key: HashMap<[u8; 16], usize> = HashMap::new();
 
         for entry in frontier {
+            self.counters.expanded_nodes += 1;
             let all_moves = generate_legal_moves(&entry.bb);
             let mover = current_player(&entry.bb).unwrap_or(0);
 
             if all_moves.is_empty() {
                 // Mover has no legal moves: the other player wins.
+                self.counters.terminal_hits += 1;
                 let value = if mover == 1 { 1.0 } else { -1.0 };
                 terminal_leaves.push(BeamLeaf {
                     moves: entry.moves.clone(),
@@ -455,9 +545,11 @@ impl BeamSearchEngine {
 
             for mv in all_moves {
                 let new_bb = apply_move(&entry.bb, &mv);
+                self.counters.generated_nodes += 1;
                 let winner = check_winner(&new_bb);
 
                 if winner != WinStatus::NoWin {
+                    self.counters.terminal_hits += 1;
                     let value = if winner == WinStatus::Player0Wins {
                         1.0
                     } else {
@@ -479,6 +571,10 @@ impl BeamSearchEngine {
                 let key = SymmetryHandler::canonical_payload(&new_bb);
                 if let Some(&existing) = index_by_key.get(&key) {
                     stats.candidates_deduped += 1;
+                    self.counters.canonical_dedup_hits += 1;
+                    if depth == 1 {
+                        self.root_dedup_hits += 1;
+                    }
                     candidates[existing].multiplicity += entry.multiplicity;
                     continue;
                 }
@@ -596,6 +692,7 @@ impl BeamSearchEngine {
 mod tests {
     use super::*;
     use crate::game::has_winning_line;
+    use crate::search_telemetry::UNPROVEN_VALUE_BOUND;
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -841,6 +938,127 @@ mod tests {
         // Survivors per level ≤ beam_width; terminals are extra but each
         // level's kept frontier is bounded.
         assert!(result.frontier_leaves.len() <= 2);
+    }
+
+    #[test]
+    fn beam_empty_board_depth1_dedup_flags_identity() {
+        let mut engine = BeamSearchEngine::new(BeamSearchConfig {
+            beam_width: 64,
+            max_depth: 2,
+            rollouts_per_candidate: 1,
+            random_seed: Some(3),
+            ..Default::default()
+        })
+        .unwrap();
+        let result = engine.search(&Bitboard::EMPTY).unwrap();
+        let t = engine.telemetry(&result);
+        // 64 symmetric first moves collapse under canonical dedup at depth 1.
+        assert!(!t.root_identity_preserved);
+        assert!(t.counters.canonical_dedup_hits > 0);
+        assert_eq!(t.counters.transposition_hits, 0);
+        assert_eq!(t.engine_kind, EngineKind::Beam);
+        assert_eq!(t.policy_mass_kind, PolicyMassKind::Multiplicity);
+    }
+
+    #[test]
+    fn beam_telemetry_invariants_and_pv() {
+        let mut engine = BeamSearchEngine::new(BeamSearchConfig {
+            beam_width: 8,
+            max_depth: 4,
+            rollouts_per_candidate: 2,
+            random_seed: Some(3),
+            ..Default::default()
+        })
+        .unwrap();
+        let result = engine.search(&Bitboard::EMPTY).unwrap();
+        let t = engine.telemetry(&result);
+        // No Quantik game ends before ply 7, and max_depth here is 4, so
+        // every leaf backing this telemetry is necessarily non-terminal —
+        // root_value and every q must respect the tighter, proven-exclusive
+        // UNPROVEN_VALUE_BOUND, never the exact ±1.0 reserved for proven
+        // (terminal) results.
+        assert!(t.root_value.abs() <= UNPROVEN_VALUE_BOUND);
+        assert!(t.counters.expanded_nodes > 0);
+        assert!(t.counters.generated_nodes >= t.counters.expanded_nodes);
+        let legal: std::collections::HashSet<u8> = generate_legal_moves(&Bitboard::EMPTY)
+            .iter()
+            .map(|m| m.shape * 16 + m.position)
+            .collect();
+        for stat in &t.root_moves {
+            assert!(legal.contains(&stat.action_index));
+            assert!(stat.policy_mass > 0);
+            if let Some(q) = stat.q_value {
+                assert!(
+                    q.abs() <= UNPROVEN_VALUE_BOUND,
+                    "non-terminal root move {:?} must respect UNPROVEN_VALUE_BOUND, got q={q}",
+                    stat.mv
+                );
+            }
+        }
+        // PV mirrors the best leaf's line.
+        assert_eq!(
+            t.principal_variation,
+            result
+                .best_leaf
+                .as_ref()
+                .map(|l| l.moves.clone())
+                .unwrap_or_default()
+        );
+        assert!(t.elapsed_ms < 60_000);
+    }
+
+    /// FIX 1 (value invariant): a ranked root move only earns the exact,
+    /// proven-exclusive `q_value` of `1.0` when `RankedRootMove::
+    /// has_terminal_win` proves it; every other root move — proven or not —
+    /// goes through `clamp_unproven` and must respect `UNPROVEN_VALUE_
+    /// BOUND`. `root_value` gets the exact `1.0` here too, since the best
+    /// leaf is itself terminal.
+    #[test]
+    fn beam_telemetry_proven_terminal_win_is_exact_others_clamped() {
+        let bb = immediate_win_board();
+        let mut engine = BeamSearchEngine::new(BeamSearchConfig {
+            beam_width: 8,
+            max_depth: 2,
+            rollouts_per_candidate: 1,
+            random_seed: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+        let result = engine.search(&bb).unwrap();
+        let ranked = result.ranked_root_moves(None);
+        let t = engine.telemetry(&result);
+
+        // At least one root move (the immediate win) is a proven win.
+        assert!(ranked
+            .iter()
+            .any(|r| r.has_terminal_win && r.best_value >= 1.0));
+
+        for r in &ranked {
+            let stat = t
+                .root_moves
+                .iter()
+                .find(|s| s.mv == r.mv)
+                .expect("every ranked root move must appear in telemetry root_moves");
+            if r.has_terminal_win && r.best_value >= 1.0 {
+                assert_eq!(
+                    stat.q_value,
+                    Some(1.0),
+                    "a proven win must report exact q_value 1.0, got {:?}",
+                    stat.q_value
+                );
+            } else if let Some(q) = stat.q_value {
+                assert!(
+                    q.abs() <= UNPROVEN_VALUE_BOUND,
+                    "unproven root move {:?} must respect UNPROVEN_VALUE_BOUND, got q={q}",
+                    r.mv
+                );
+            }
+        }
+
+        // The best leaf here is terminal (the immediate win), so root_value
+        // must be the exact proven 1.0.
+        assert!(result.best_leaf.as_ref().unwrap().is_terminal);
+        assert_eq!(t.root_value, 1.0);
     }
 
     #[test]
