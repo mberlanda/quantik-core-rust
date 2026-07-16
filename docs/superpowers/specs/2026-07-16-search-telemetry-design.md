@@ -41,7 +41,7 @@ Vocabulary follows the standard search-literature distinction: a state is
 
 | Counter | Event (same in every engine) |
 | --- | --- |
-| `expanded_nodes` | A state's successors were enumerated. |
+| `expanded_nodes` | A state's successor set was computed by the search. |
 | `generated_nodes` | A successor state was constructed. |
 | `transposition_hits` | A cached **search result or subtree** was reused via state-keyed lookup instead of being searched again. |
 | `canonical_dedup_hits` | A generated state was merged with, or skipped in favor of, an already-present duplicate — **without reusing any search result**. |
