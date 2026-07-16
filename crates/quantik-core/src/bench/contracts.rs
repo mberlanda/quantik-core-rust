@@ -2114,6 +2114,11 @@ pub fn search_summary_row(
     let mut root_q_values = vec![Value::Null; 64];
     for stat in &telemetry.root_moves {
         let idx = stat.action_index as usize;
+        if idx >= 64 {
+            return Err(format!(
+                "root move action_index {idx} out of range (must be < 64)"
+            ));
+        }
         policy_visits[idx] = stat.policy_mass;
         if let Some(q) = stat.q_value {
             root_q_values[idx] = json!(q);

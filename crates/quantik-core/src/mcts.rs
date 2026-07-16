@@ -390,9 +390,12 @@ impl MCTSEngine {
         self.nodes.len()
     }
 
-    /// Telemetry for the most recent `search()` call; `None` if `search`
-    /// has not run or found no legal moves. See the `search_telemetry`
-    /// module docs for the normative counter semantics.
+    /// Telemetry for the most recent `search()` call; `None` whenever the
+    /// root has no expanded children — `search` has not run, the root was
+    /// terminal or had no legal moves, or the iteration budget was
+    /// exhausted before any child was expanded (e.g. `max_iterations`
+    /// of 0). See the `search_telemetry` module docs for the normative
+    /// counter semantics.
     pub fn telemetry(&self) -> Option<SearchTelemetry> {
         let root = self.nodes.first()?;
         if root.children.is_empty() {

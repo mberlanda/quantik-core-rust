@@ -414,8 +414,15 @@ impl BeamSearchEngine {
 
     /// Telemetry for `result` (from this engine's most recent `search`).
     /// Root data derives from `ranked_root_moves(None)`; counters and
-    /// elapsed come from that run. See the `search_telemetry` module docs
-    /// for the normative counter semantics.
+    /// elapsed come from that run.
+    ///
+    /// Precondition: `result` MUST be the value returned by the most
+    /// recent `search` call on this same engine instance. Root moves and
+    /// the principal variation come from `result` while counters and
+    /// `elapsed_ms` live on the engine, so pairing a result from an
+    /// earlier run or another instance yields silently inconsistent
+    /// telemetry. See the `search_telemetry` module docs for the
+    /// normative counter semantics.
     pub fn telemetry(&self, result: &BeamSearchResult) -> SearchTelemetry {
         let ranked = result.ranked_root_moves(None);
         // `has_terminal_win` proves `best_value == 1.0` only (a root-player
