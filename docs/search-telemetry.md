@@ -72,20 +72,36 @@ Distinctions worth calling out explicitly:
 
 Invariant: `root_value` and every `RootMoveStat::q_value` lie in `[-1.0,
 1.0]`, positive is good for the root player, and `|v| = 1.0` only for proven
-results.
+results (terminal nodes, mates). Every unproven (sampled or heuristic)
+estimate is clamped to `[-UNPROVEN_VALUE_BOUND, UNPROVEN_VALUE_BOUND]` (`1.0 -
+1e-6`) via `clamp_unproven` in `crates/quantik-core/src/search_telemetry.rs`,
+so a sampled or heuristic value can never be mistaken for a proven `±1.0`.
 
 Per-engine mapping:
 
-- **MCTS**: win probability `p` for the root player maps to `2p - 1`.
+- **MCTS**: win probability `p` for the root player maps to `2p - 1`. A
+  terminal child (and a terminal best child's `root_value`) is a PROVEN
+  result: its value is derived directly from the node's `terminal_value`
+  (P0-perspective; negated for the root's perspective when the root mover is
+  player 1) and reported as exact `±1.0`. Every non-terminal child's
+  rollout-sampled `2p - 1` goes through `clamp_unproven` instead.
 - **Minimax**: `minimax_q_from_score(score, win)` in
   `crates/quantik-core/src/minimax.rs`. Mate scores are `±(win - ply)` with
   `ply <= 16`, so a proven result satisfies `|score| >= win - 16.0` and maps
   to exactly `±1.0`. Everything else is squashed with the smooth,
   monotonic, sign-preserving `score / (1.0 + score.abs())`, which stays
   strictly inside `(-1, 1)`.
-- **Beam**: evaluator output is clamped to `[-1.0, 1.0]` (`best_value`
-  clamped when read into telemetry, and the evaluator itself clamps raw
-  scores at the source).
+- **Beam**: a ranked root move's `q_value` is exact `1.0` only when
+  `RankedRootMove::has_terminal_win` is set and `best_value >= 1.0` — a
+  proven root-player win via that move. `RankedRootMove` carries no
+  equivalent flag for a proven *loss*: once a terminal loss and a sampled
+  loss both collapse to `best_value == -1.0`, they are indistinguishable, so
+  every other case (including a proven loss) goes through `clamp_unproven`.
+  This is a deliberate, documented conservatism: a proven loss is reported
+  as `-UNPROVEN_VALUE_BOUND` rather than exactly `-1.0`. `root_value` follows
+  the same rule at the `best_leaf` level: exact `±1.0` when `best_leaf` is
+  terminal (its `value` is `±1.0` by construction), `clamp_unproven`
+  otherwise.
 
 `PolicyMassKind` per engine: MCTS = `Visits` (true root visit counts), beam =
 `Multiplicity` (leaf multiplicity grouped by first move), minimax = `None`

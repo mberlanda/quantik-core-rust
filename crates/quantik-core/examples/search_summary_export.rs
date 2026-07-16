@@ -25,7 +25,7 @@ const RUN_ID: &str = "search-summary-export";
 
 /// Fixed positions to export telemetry for: the empty board plus two
 /// known-valid mid-game positions reused from existing fixtures
-/// (`state.rs`'s `mixed_position` QFEN test and
+/// (`qfen.rs`'s `mixed_position` QFEN test and
 /// `tests/portability_report.rs`'s contract-shape fixture).
 const POSITIONS: &[(&str, &str)] = &[
     ("empty", "..../..../..../...."),

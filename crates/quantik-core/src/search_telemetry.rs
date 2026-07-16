@@ -19,8 +19,33 @@
 //! iteration budget, minimax expands exhaustively to a depth, beam prunes by
 //! design. `expanded_nodes` measures the same event everywhere, but
 //! cross-engine workload comparison belongs to `elapsed_ms` only.
+//!
+//! ## Value invariant
+//!
+//! Every `root_value` and `RootMoveStat::q_value` lies in `[-1.0, 1.0]`,
+//! positive is good for the root player, and exact `±1.0` is reserved for
+//! **proven** results: MCTS terminal children (and a terminal best child's
+//! `root_value`), beam terminal-win leaves (and a terminal best leaf's
+//! `root_value`), and minimax mate scores. Every unproven (sampled or
+//! heuristic) estimate is clamped to `[-UNPROVEN_VALUE_BOUND,
+//! UNPROVEN_VALUE_BOUND]` via [`clamp_unproven`] so it can never be
+//! mistaken for a proven result. One documented exception: beam has no way
+//! to distinguish a terminal loss from a sampled loss once both collapse to
+//! `best_value == -1.0` on a `RankedRootMove` (see [`clamp_unproven`]'s
+//! call site in `beam_search.rs`), so a proven loss is conservatively
+//! reported as `-UNPROVEN_VALUE_BOUND` rather than exactly `-1.0`.
 
 use crate::moves::Move;
+
+/// Largest magnitude an UNPROVEN (sampled or heuristic) value may take.
+/// Exact ±1.0 is reserved for proven results (terminal nodes, mates); see
+/// the module docs' value invariant.
+pub const UNPROVEN_VALUE_BOUND: f64 = 1.0 - 1e-6;
+
+/// Clamp a sampled/heuristic estimate into the open proven-exclusive range.
+pub fn clamp_unproven(v: f64) -> f64 {
+    v.clamp(-UNPROVEN_VALUE_BOUND, UNPROVEN_VALUE_BOUND)
+}
 
 /// Which engine produced a [`SearchTelemetry`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,7 +108,9 @@ pub struct RootMoveStat {
     /// Semantics per the telemetry's [`PolicyMassKind`]; 0 when `None`.
     pub policy_mass: u64,
     /// `[-1, 1]`, root-player perspective; `None` when the engine has no
-    /// value estimate for this move (e.g. an unvisited MCTS child).
+    /// value estimate for this move (e.g. an unvisited MCTS child). Exact
+    /// `±1.0` only for a proven result; see the module docs' value
+    /// invariant and [`clamp_unproven`].
     pub q_value: Option<f64>,
 }
 
@@ -103,6 +130,7 @@ impl RootMoveStat {
 pub struct SearchTelemetry {
     pub engine_kind: EngineKind,
     /// `[-1, 1]`, root-player perspective; `|v| = 1` only for proven results.
+    /// See the module docs' value invariant and [`clamp_unproven`].
     pub root_value: f64,
     pub policy_mass_kind: PolicyMassKind,
     pub root_moves: Vec<RootMoveStat>,
@@ -136,6 +164,15 @@ mod tests {
         assert_eq!(EngineKind::Mcts.as_str(), "mcts");
         assert_eq!(EngineKind::Beam.as_str(), "beam");
         assert_eq!(EngineKind::Minimax.as_str(), "minimax");
+    }
+
+    #[test]
+    fn clamp_unproven_never_reaches_exact_one() {
+        assert_eq!(clamp_unproven(1.0), UNPROVEN_VALUE_BOUND);
+        assert_eq!(clamp_unproven(-1.0), -UNPROVEN_VALUE_BOUND);
+        assert_eq!(clamp_unproven(2.5), UNPROVEN_VALUE_BOUND);
+        assert_eq!(clamp_unproven(-2.5), -UNPROVEN_VALUE_BOUND);
+        assert_eq!(clamp_unproven(0.3), 0.3);
     }
 
     #[test]

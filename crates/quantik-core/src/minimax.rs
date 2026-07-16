@@ -224,7 +224,7 @@ impl MinimaxEngine {
         // Derive from the same (already-final) elapsed value written into
         // the returned result, so telemetry's elapsed_ms always matches
         // exactly what the caller sees on `result.elapsed`.
-        self.last_elapsed_ms = (result.elapsed * 1000.0) as u64;
+        self.last_elapsed_ms = (result.elapsed * 1000.0).round() as u64;
         Ok(result)
     }
 
