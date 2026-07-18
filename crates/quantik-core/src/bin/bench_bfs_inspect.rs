@@ -352,7 +352,7 @@ fn write_summary_json(
     let total_edges = per_depth.iter().map(|row| row.edges).sum();
     let summary = OpeningBookSummary {
         schema: "opening-book-summary.v1",
-        contract_version: "1.1.0",
+        contract_version: "1.2.0",
         depth: expected_depth,
         total_positions,
         terminal_positions,
