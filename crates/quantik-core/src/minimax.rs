@@ -189,6 +189,11 @@ impl MinimaxEngine {
         if root_moves.is_empty() {
             return Err("Cannot search from a state with no legal moves.".into());
         }
+        // The root's successor set is computed once here and reused across every
+        // iterative-deepening pass, so count the root expansion exactly once
+        // (not per depth). Interior nodes regenerate their moves on each visit
+        // and are counted in `negamax`.
+        self.counters.expanded_nodes += 1;
 
         let mut result: Option<MinimaxResult> = None;
         for depth in 1..=self.config.max_depth {
@@ -280,13 +285,13 @@ impl MinimaxEngine {
     /// first survivor in `moves`' order, preserving the lowest
     /// `(shape, position)` tie-break).
     ///
-    /// Counts one `expanded_nodes` per invocation (this is the "a state's
-    /// successor set was computed" event for both the root call in
-    /// `search_root` and every recursive call in `negamax`), `generated_nodes`
-    /// for every move applied (before dedup filtering), and
-    /// `canonical_dedup_hits` for each sibling collapsed by dedup.
+    /// Counts `generated_nodes` for every move applied (before dedup filtering)
+    /// and `canonical_dedup_hits` for each sibling collapsed by dedup.
+    /// `expanded_nodes` (the "a state's successor set was computed" event) is
+    /// counted at the move-generation sites instead -- once for the root moves
+    /// in `search` and once per node right after `generate_legal_moves` in
+    /// `negamax` -- so the no-legal-moves and depth-0 leaf nodes are counted too.
     fn children(&mut self, bb: &Bitboard, moves: &[Move], dedup: bool) -> Vec<ChildEntry> {
-        self.counters.expanded_nodes += 1;
         self.counters.generated_nodes += moves.len() as u64;
         if !dedup {
             return moves
@@ -405,6 +410,10 @@ impl MinimaxEngine {
         }
 
         let moves = generate_legal_moves(bb);
+        // The successor set was just computed, so this node is expanded --
+        // including the no-legal-moves case below (which is then ALSO terminal)
+        // and the depth-0 leaf case, which returns before any child is built.
+        self.counters.expanded_nodes += 1;
         if moves.is_empty() {
             // No legal moves: the side to move also loses.
             self.counters.terminal_hits += 1;
@@ -729,5 +738,65 @@ mod tests {
         // No Quantik game ends before ply 7, so a depth-3 tree has no terminals.
         assert_eq!(t.counters.terminal_hits, 0);
         assert!(t.counters.expanded_nodes > 0);
+    }
+
+    #[test]
+    fn expanded_counted_at_move_generation() {
+        // expanded_nodes is the "successor set was computed" event, so it fires
+        // once per generate_legal_moves call: once for the root moves and once
+        // per negamax node -- INCLUDING the depth-0 leaf children, which compute
+        // their successor set before the leaf evaluation short-circuits. A
+        // depth-1 search over K non-terminal root moves therefore yields
+        // expanded_nodes == K + 1 and generated_nodes == K. Before the fix,
+        // expanded was counted at the children() sites, so the depth-0 leaves
+        // were never counted and expanded_nodes was just 1.
+        let bb = Bitboard::EMPTY;
+        let k = generate_legal_moves(&bb).len() as u64;
+        let mut engine = MinimaxEngine::new(MinimaxConfig {
+            max_depth: 1,
+            dedup_children: false,
+            use_transposition_table: false,
+            ..Default::default()
+        });
+        engine.search(&State::new(bb)).unwrap();
+        let t = engine.telemetry().unwrap();
+        assert_eq!(t.counters.expanded_nodes, k + 1);
+        assert_eq!(t.counters.generated_nodes, k);
+    }
+
+    #[test]
+    fn no_legal_moves_node_is_expanded_and_terminal() {
+        // A no-legal-moves node computed its (empty) successor set before being
+        // ruled terminal, so it must be BOTH expanded and terminal (per the
+        // normative counter semantics). A full single-shape board has no winning
+        // line and no legal moves; negamax on it must bump both counters. Built
+        // via the public `with_move` API (player 0, shape 0 on every cell)
+        // rather than a raw plane literal, so the test does not depend on the
+        // internal plane ordering.
+        let no_moves = (0..16u8).fold(Bitboard::EMPTY, |b, pos| b.with_move(0, 0, pos));
+        assert!(generate_legal_moves(&no_moves).is_empty());
+        let mut engine = MinimaxEngine::new(MinimaxConfig {
+            max_depth: 2,
+            dedup_children: false,
+            use_transposition_table: false,
+            ..Default::default()
+        });
+        engine.counters = SearchEventCounters::default();
+        engine.nodes = 0;
+        engine.deadline = None;
+        // deadline == None => negamax cannot return Err(TimeUp); discard the
+        // Ok value (TimeUp is not Debug, so `.unwrap()` would not compile).
+        let mut pv = Vec::new();
+        let _ = engine.negamax(
+            &no_moves,
+            1,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            0,
+            &mut pv,
+            None,
+        );
+        assert_eq!(engine.counters.terminal_hits, 1);
+        assert_eq!(engine.counters.expanded_nodes, 1);
     }
 }

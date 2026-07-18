@@ -53,7 +53,7 @@ workload comparison belongs to `elapsed_ms` only.
 
 | Counter | MCTS | Beam | Minimax |
 | --- | --- | --- | --- |
-| `expanded_nodes` | +1 per node created (root push in `search()`, child push in `expand()`) — the state's successor set was just computed via `generate_legal_moves`. | +1 per frontier entry processed in `generate_candidates`, including the no-legal-moves case. | +1 per `children()` invocation on a state: the root call in `search_root` and each call in `negamax`. |
+| `expanded_nodes` | +1 per node created (root push in `search()`, child push in `expand()`) — the state's successor set was just computed via `generate_legal_moves`. | +1 per frontier entry processed in `generate_candidates`, including the no-legal-moves case. | +1 per successor-set computation: once for the root moves in `search`, then once right after `generate_legal_moves` in each `negamax` node (the depth-0 leaf and the no-legal-moves node included; a `has_winning_line` node returns before enumeration and is not counted). |
 | `generated_nodes` | +1 per `apply_move` in `expand()`. | +1 per `apply_move` on a candidate move. | += `moves.len()` inside `children()` (every move is applied before dedup filtering). |
 | `transposition_hits` | +1 in the TT early-return branch of `expand()`. | Always 0 — beam never reuses search results. | +1 at each TT early-return: `Bound::Exact` and the narrowed `alpha >= beta` return. |
 | `canonical_dedup_hits` | Not applicable at the counter level (MCTS canonical merging is tracked via `root_identity_preserved`, not this counter). | +1 at the dedup-merge branch; a private `root_dedup_hits` also increments only when `depth == 1`. | +1 per dedup skip inside `children()`. |
