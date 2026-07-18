@@ -1,6 +1,6 @@
-//! Draft search-telemetry exporter: runs the MCTS, minimax, and beam
+//! Search-telemetry exporter: runs the MCTS, minimax, and beam
 //! engines against a handful of fixed positions and writes one
-//! `search-summary.v1-draft` JSONL row (see `bench::contracts::search_summary_row`)
+//! `search-summary.v1` JSONL row (see `bench::contracts::search_summary_row`)
 //! per completed root search whose root identity was preserved. A row is
 //! legitimately skipped (not an error) whenever canonical/transposition
 //! merging collapsed distinct root moves onto shared statistics — see the
