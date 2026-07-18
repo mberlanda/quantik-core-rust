@@ -769,8 +769,11 @@ mod tests {
         // A no-legal-moves node computed its (empty) successor set before being
         // ruled terminal, so it must be BOTH expanded and terminal (per the
         // normative counter semantics). A full single-shape board has no winning
-        // line and no legal moves; negamax on it must bump both counters.
-        let no_moves = Bitboard::new([0xFFFF, 0, 0, 0, 0, 0, 0, 0]);
+        // line and no legal moves; negamax on it must bump both counters. Built
+        // via the public `with_move` API (player 0, shape 0 on every cell)
+        // rather than a raw plane literal, so the test does not depend on the
+        // internal plane ordering.
+        let no_moves = (0..16u8).fold(Bitboard::EMPTY, |b, pos| b.with_move(0, 0, pos));
         assert!(generate_legal_moves(&no_moves).is_empty());
         let mut engine = MinimaxEngine::new(MinimaxConfig {
             max_depth: 2,
