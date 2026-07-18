@@ -88,7 +88,7 @@ jobs:
         run: python -m pip install -e .
 
       - name: Run opening-book consistency action
-        uses: mberlanda/quantik-core-contracts/actions/opening-book-consistency@v1.1.0
+        uses: mberlanda/quantik-core-contracts/actions/opening-book-consistency@v1.2.0
         with:
           rust-command: |
             mkdir -p quantik-core-rust/target/opening-book-consistency
@@ -112,7 +112,7 @@ jobs:
           rust-summary: quantik-core-rust/target/opening-book-consistency/rust-summary.json
           python-summary: quantik-core-rust/target/opening-book-consistency/python-summary.json
           expected-depth: "4"
-          expected-release: "1.1.0"
+          expected-release: "1.2.0"
 
   release-artifacts:
     name: Publish release artifacts
@@ -178,7 +178,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: ci
     # Crate publishing is manual for now, matching the release process used for
-    # v1.1.0.
+    # v1.2.0.
     if: ${{ false }}
     environment: release
     permissions:

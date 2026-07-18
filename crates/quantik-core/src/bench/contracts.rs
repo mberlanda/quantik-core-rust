@@ -2807,7 +2807,7 @@ mod tests {
     }
 
     #[test]
-    fn selfplay_row_builder_emits_release_1_1_0_contract_json() {
+    fn selfplay_row_builder_emits_release_1_2_0_contract_json() {
         let row = selfplay_v1_row(
             7,
             0,
