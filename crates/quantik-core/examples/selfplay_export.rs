@@ -8,7 +8,7 @@
 //! Row schema (one per line, compact canonical JSON):
 //! {
 //!   "schema": "selfplay.v1",
-//!   "contract_version": "1.1.0",
+//!   "contract_version": "1.2.0",
 //!   "game_id": u64,
 //!   "ply": u32,
 //!   "qfen": string,
