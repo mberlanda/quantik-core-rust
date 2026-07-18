@@ -4,6 +4,24 @@ All notable changes to `quantik-core` are documented here.
 
 ## Unreleased
 
+## 1.2.0 - 2026-07-18
+
+### Added
+
+- Event-based search telemetry (`SearchTelemetry`) for the MCTS, beam, and
+  minimax engines, and a `search-summary.v1` JSONL exporter
+  (`bench::contracts::search_summary_row`).
+
+### Changed
+
+- Minimax `expanded_nodes` is now counted at the successor-set computation, so a
+  no-legal-moves node is both expanded and terminal (matching the normative
+  counter semantics).
+- Adopted the registered `search-summary.v1` schema label.
+- Bumped the crate version and all `*_CONTRACT_VERSION` constants to `1.2.0`,
+  tracking the contracts `1.2.0` release (which adds `search-summary.v1` and
+  `model-checkpoint.v1`).
+
 ## 1.1.0 - 2026-07-14
 
 ### Added

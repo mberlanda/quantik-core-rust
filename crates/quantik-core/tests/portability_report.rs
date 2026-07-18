@@ -16,11 +16,11 @@ fn test_contracts_root(name: &str) -> PathBuf {
     ));
     let fixture_dir = root.join("fixtures/api-portability");
     fs::create_dir_all(&fixture_dir).expect("fixture dir should be created");
-    fs::write(root.join("VERSION"), "1.1.0\n").expect("VERSION should be written");
+    fs::write(root.join("VERSION"), "1.2.0\n").expect("VERSION should be written");
     fs::write(
         root.join("contracts.json"),
         r#"{
-  "release_version": "1.1.0",
+  "release_version": "1.2.0",
   "contracts": {
     "qfen": {"id": "qfen.v1"},
     "bitboard": {"id": "bitboard.v1"},
@@ -34,7 +34,7 @@ fn test_contracts_root(name: &str) -> PathBuf {
         fixture_dir.join("game-state-v1.json"),
         r#"{
   "schema": "api-portability-fixtures.v1",
-  "contract_version": "1.1.0",
+  "contract_version": "1.2.0",
   "game_state_cases": [
     {
       "case_id": "empty-board",
@@ -86,7 +86,7 @@ fn build_report_projects_contract_metadata_and_sorted_cases() {
     let report = build_report(&contracts_root).expect("report should build from fixture");
 
     assert_eq!(report["schema"], "api-portability-report.v1");
-    assert_eq!(report["contracts_release"], "1.1.0");
+    assert_eq!(report["contracts_release"], "1.2.0");
     assert_eq!(report["implementation"]["language"], "rust");
     assert_eq!(report["implementation"]["package"], "quantik-core");
     assert_eq!(
@@ -184,7 +184,7 @@ fn build_report_rejects_empty_case_fixture() {
         contracts_root.join("fixtures/api-portability/game-state-v1.json"),
         r#"{
   "schema": "api-portability-fixtures.v1",
-  "contract_version": "1.1.0",
+  "contract_version": "1.2.0",
   "game_state_cases": []
 }
 "#,
