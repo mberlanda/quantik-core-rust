@@ -2080,7 +2080,7 @@ pub fn observation_v1_row(
     }))
 }
 
-/// Engine run configuration echoed into a `search-summary.v1-draft` row;
+/// Engine run configuration echoed into a `search-summary.v1` row;
 /// `None` fields map to JSON `null`.
 pub struct SearchSummaryRunConfig<'a> {
     pub config_label: &'a str,
@@ -2091,7 +2091,7 @@ pub struct SearchSummaryRunConfig<'a> {
     pub time_budget_ms: Option<u64>,
 }
 
-/// One draft `search-summary.v1-draft` row for a single completed root
+/// One `search-summary.v1` row for a single completed root
 /// search, or `Ok(None)` when `telemetry.root_identity_preserved` is
 /// false — such rows are skipped, per the design spec's Root Identity
 /// section, since canonical/transposition merging may have collapsed

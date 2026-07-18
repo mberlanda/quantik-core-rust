@@ -3,8 +3,8 @@
 This document describes the `search_telemetry` surface shared by the MCTS,
 beam, and minimax engines in this crate: what each event counter means, how
 each engine maps its internal values onto a common `[-1, 1]` scale, when a
-telemetry record's root-move identity is trustworthy, and how to export draft
-JSONL rows for offline analysis.
+telemetry record's root-move identity is trustworthy, and how to export
+`search-summary.v1` JSONL rows for offline analysis.
 
 ## 1. Purpose
 
