@@ -35,10 +35,11 @@ pub const OPENING_BOOK_SCHEMA: &str = "opening-book.v1";
 pub const OBSERVATION_SCHEMA: &str = "observation.v1";
 pub const GAME_RESULT_SCHEMA: &str = "game-result.v1";
 pub const MODEL_CHECKPOINT_SCHEMA: &str = "model-checkpoint.v1";
-/// Draft, unstable schema for per-search-call telemetry rows. Not part of
-/// `SUPPORTED_MODEL_INPUT_CONTRACTS` — this is a draft surface, not a
-/// stabilized cross-repository contract.
-pub const SEARCH_SUMMARY_DRAFT_SCHEMA: &str = "search-summary.v1-draft";
+/// Registered schema label for per-search-call telemetry rows
+/// (`search-summary.v1` in quantik-core-contracts). Not part of
+/// `SUPPORTED_MODEL_INPUT_CONTRACTS`: it is a search-diagnostic output, not a
+/// model input.
+pub const SEARCH_SUMMARY_SCHEMA: &str = "search-summary.v1";
 
 const SUPPORTED_MODEL_INPUT_CONTRACTS: &[&str] = &[
     "qfen.v1",
@@ -2132,7 +2133,7 @@ pub fn search_summary_row(
         .collect();
 
     Ok(Some(json!({
-        "schema": SEARCH_SUMMARY_DRAFT_SCHEMA,
+        "schema": SEARCH_SUMMARY_SCHEMA,
         "contract_version": SEARCH_SUMMARY_CONTRACT_VERSION,
         "run_id": run_id,
         "row_id": row_id,
@@ -2329,7 +2330,7 @@ mod tests {
         let row = search_summary_row(0, "run-test", &empty_qfen, &telemetry, &run_config)
             .unwrap()
             .expect("identity preserved rows are emitted");
-        assert_eq!(row["schema"], SEARCH_SUMMARY_DRAFT_SCHEMA);
+        assert_eq!(row["schema"], SEARCH_SUMMARY_SCHEMA);
         assert_eq!(row["engine_kind"], "mcts");
         assert_eq!(row["policy_visits"].as_array().unwrap().len(), 64);
         assert_eq!(row["root_q_values"].as_array().unwrap().len(), 64);

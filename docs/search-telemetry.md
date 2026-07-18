@@ -8,14 +8,13 @@ JSONL rows for offline analysis.
 
 ## 1. Purpose
 
-`search-summary.v1` is a proposed but not-yet-registered data contract for
-search diagnostics (event counters, root-move statistics, principal
-variation) emitted by any of this crate's search engines. Registration
-requires that the Rust and Python implementations expose the same observable
-semantics before any artifact carries the finished contract label. This crate
-adds the telemetry types, the per-engine instrumentation, and a draft JSONL
-exporter as the first of a three-part workstream (Rust surface, Python
-mirror, then contract registration).
+`search-summary.v1` is a registered data contract
+(`quantik-core-contracts` `schemas/search-summary-v1.json`) for search
+diagnostics (event counters, root-move statistics, principal variation) emitted
+by any of this crate's search engines. The Rust surface, the Python mirror, and
+the contract registration all landed; this crate provides the telemetry types,
+the per-engine instrumentation, and the JSONL exporter that emits the stable
+`search-summary.v1` label.
 
 See also:
 - Design spec: `docs/superpowers/specs/2026-07-16-search-telemetry-design.md`
@@ -137,7 +136,7 @@ treat beam skips as expected rather than a bug to chase.
 
 ## 6. Exporter usage
 
-Run the draft exporter example against a small fixed position set (the empty
+Run the exporter example against a small fixed position set (the empty
 board plus two mid-game positions), across all three engines:
 
 ```sh
@@ -145,11 +144,10 @@ cargo run -p quantik-core --example search_summary_export -- --out <path>
 ```
 
 This writes one JSON line per completed root search whose root identity was
-preserved, using the schema label `search-summary.v1-draft`
-(`SEARCH_SUMMARY_DRAFT_SCHEMA` in `bench::contracts`). Rows that are skipped
+preserved, using the registered schema label `search-summary.v1`
+(`SEARCH_SUMMARY_SCHEMA` in `bench::contracts`). Rows that are skipped
 for an unpreserved root identity are logged to stderr, not written.
 
-**`search-summary.v1` (the non-draft label) must not be emitted anywhere
-until the contract is registered in `quantik-core-contracts`.** The draft
-label exists specifically so downstream consumers can distinguish
-work-in-progress rows from a finished, versioned contract.
+The contract is registered in `quantik-core-contracts`
+(`schemas/search-summary-v1.json`), so downstream consumers can rely on the
+stable `search-summary.v1` label.
