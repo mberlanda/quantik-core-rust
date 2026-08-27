@@ -13,7 +13,14 @@
 //!
 //! ```sh
 //! cargo run --release --example exact_oracle < positions.txt > oracle.jsonl
+//! cargo run --release --example exact_oracle -- --roots-only < positions.txt
 //! ```
+//!
+//! `--roots-only` emits just each position's own exact value, skipping the
+//! per-move breakdown. That is ~25x cheaper (one solve instead of one per
+//! legal move) and is enough to reconstruct the moves by backward induction
+//! when the *whole* level below is solved: a position's optimal moves are
+//! exactly those leading to a child the opponent loses.
 
 use quantik_core::game::{current_player, has_winning_line};
 use quantik_core::minimax::{MinimaxConfig, MinimaxEngine};
@@ -35,6 +42,25 @@ fn solve_score(state: &State) -> f64 {
         .solve(state)
         .map(|result| result.score)
         .unwrap_or(TERMINAL)
+}
+
+/// Just the root's own exact value — one solve, no per-move breakdown.
+fn root_line(qfen: &str) -> Result<String, String> {
+    let state = State::from_qfen(qfen)?;
+    if current_player(&state.bb).is_none() {
+        return Err(format!("inconsistent position: {qfen}"));
+    }
+    if has_winning_line(&state.bb) || generate_legal_moves(&state.bb).is_empty() {
+        // Terminal: the side to move has already lost.
+        return Ok(format!("{{\"qfen\":\"{qfen}\",\"score\":{TERMINAL},\"won\":false}}"));
+    }
+    let score = solve_score(&state);
+    Ok(format!(
+        "{{\"qfen\":\"{}\",\"score\":{},\"won\":{}}}",
+        qfen,
+        score,
+        score > 0.0
+    ))
 }
 
 fn oracle_line(qfen: &str) -> Result<String, String> {
@@ -96,6 +122,7 @@ fn oracle_line(qfen: &str) -> Result<String, String> {
 }
 
 fn main() {
+    let roots_only = std::env::args().any(|arg| arg == "--roots-only");
     let stdin = io::stdin();
     let positions: Vec<String> = stdin
         .lock()
@@ -114,9 +141,13 @@ fn main() {
     let lines: Vec<Result<String, String>> = positions
         .par_iter()
         .map(|qfen| {
-            let result = oracle_line(qfen);
+            let result = if roots_only {
+                root_line(qfen)
+            } else {
+                oracle_line(qfen)
+            };
             let seen = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if seen % 2000 == 0 {
+            if seen % 20000 == 0 {
                 eprintln!("  {seen}/{total}");
             }
             result
