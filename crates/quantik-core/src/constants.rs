@@ -1,3 +1,7 @@
+/// Semantic version of the `quantik-core` crate that built this library.
+pub const PACKAGE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Version byte used by the compact binary state format.
 pub const VERSION: u8 = 1;
 pub const FLAG_CANON: u8 = 1 << 1;
 
