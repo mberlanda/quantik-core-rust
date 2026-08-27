@@ -21,14 +21,55 @@
 //! legal move) and is enough to reconstruct the moves by backward induction
 //! when the *whole* level below is solved: a position's optimal moves are
 //! exactly those leading to a child the opponent loses.
+//!
+//! Two operational properties matter for the million-position runs this is
+//! built for:
+//!
+//! * **Results stream out.** Positions are solved in chunks and each chunk is
+//!   written and flushed before the next starts, so interrupting the process
+//!   keeps everything solved so far. With `--append-to`, re-running skips the
+//!   QFENs already in the output, which makes a long solve resumable.
+//! * **Thread count is bounded.** `--threads N` sizes the rayon pool. The
+//!   default saturates every core, which is right for a dedicated batch run
+//!   and wrong when anything else needs the machine — including a second copy
+//!   of this tool.
 
 use quantik_core::game::{current_player, has_winning_line};
 use quantik_core::minimax::{MinimaxConfig, MinimaxEngine};
 use quantik_core::moves::{apply_move, generate_legal_moves};
 use quantik_core::state::State;
 use rayon::prelude::*;
-use std::io::{self, BufRead, Write};
+use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::io::{self, BufRead, BufReader, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Positions solved between output flushes. Large enough that the write is
+/// negligible, small enough that an interrupt loses seconds, not hours.
+const CHUNK: usize = 2_000;
+
+fn flag_value(name: &str) -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    args.iter()
+        .position(|arg| arg == name)
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+}
+
+/// QFENs already present in `path`, so a resumed run does not redo them.
+fn already_solved(path: &str) -> HashSet<String> {
+    let mut seen = HashSet::new();
+    if let Ok(file) = std::fs::File::open(path) {
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            if let Some(rest) = line.split("\"qfen\":\"").nth(1) {
+                if let Some(qfen) = rest.split('"').next() {
+                    seen.insert(qfen.to_string());
+                }
+            }
+        }
+    }
+    seen
+}
 
 /// Score assigned to a position whose side to move has already lost.
 const TERMINAL: f64 = -10_000.0;
@@ -123,43 +164,70 @@ fn oracle_line(qfen: &str) -> Result<String, String> {
 
 fn main() {
     let roots_only = std::env::args().any(|arg| arg == "--roots-only");
+    if let Some(threads) = flag_value("--threads").and_then(|v| v.parse::<usize>().ok()) {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+            .expect("thread pool");
+        eprintln!("rayon pool: {threads} threads");
+    }
+    let append_to = flag_value("--append-to");
+
     let stdin = io::stdin();
-    let positions: Vec<String> = stdin
+    let mut positions: Vec<String> = stdin
         .lock()
         .lines()
-        .filter_map(|line| line.ok())
+        .map_while(Result::ok)
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty())
         .collect();
 
+    // Resume: drop anything the output file already holds.
+    let mut sink: Box<dyn Write> = match &append_to {
+        Some(path) => {
+            let seen = already_solved(path);
+            if !seen.is_empty() {
+                let before = positions.len();
+                positions.retain(|qfen| !seen.contains(qfen));
+                eprintln!("resuming: {} of {before} already solved", seen.len());
+            }
+            Box::new(io::BufWriter::new(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .expect("open output"),
+            ))
+        }
+        None => Box::new(io::BufWriter::new(io::stdout())),
+    };
+
     let total = positions.len();
     eprintln!("solving {total} positions");
     let done = AtomicUsize::new(0);
-    // Parallelize across positions rather than across one position's
-    // children: batch throughput is what matters here, and child-level
-    // parallelism leaves most cores idle on cheap late-game positions.
-    let lines: Vec<Result<String, String>> = positions
-        .par_iter()
-        .map(|qfen| {
-            let result = if roots_only {
-                root_line(qfen)
-            } else {
-                oracle_line(qfen)
-            };
-            let seen = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if seen % 20000 == 0 {
-                eprintln!("  {seen}/{total}");
-            }
-            result
-        })
-        .collect();
 
-    let stdout = io::stdout();
-    let mut out = io::BufWriter::new(stdout.lock());
-    for line in lines {
-        match line {
-            Ok(text) => writeln!(out, "{text}").expect("write"),
-            Err(message) => eprintln!("skipped: {message}"),
+    // Solve in chunks and flush each one: a million-position run must not lose
+    // everything to an interrupt, and buffering it all costs memory for nothing.
+    for chunk in positions.chunks(CHUNK) {
+        let lines: Vec<Result<String, String>> = chunk
+            .par_iter()
+            .map(|qfen| {
+                let result = if roots_only {
+                    root_line(qfen)
+                } else {
+                    oracle_line(qfen)
+                };
+                done.fetch_add(1, Ordering::Relaxed);
+                result
+            })
+            .collect();
+        for line in lines {
+            match line {
+                Ok(text) => writeln!(sink, "{text}").expect("write"),
+                Err(message) => eprintln!("skipped: {message}"),
+            }
         }
+        sink.flush().expect("flush");
+        eprintln!("  {}/{}", done.load(Ordering::Relaxed), total);
     }
 }
