@@ -4,6 +4,10 @@ A high-performance Rust engine for the Quantik board game, designed for fast
 move generation, win detection, Monte Carlo search, symmetry-aware storage, and
 opening-book construction.
 
+The workspace also contains [`quantik-api`](crates/quantik-api/README.md), an
+Axum gateway that exposes the Rust Minimax, MCTS, and Beam engines to browser
+and remote clients without adding HTTP dependencies to the core crate.
+
 This crate is the Rust companion to
 [`quantik-core` on PyPI](https://pypi.org/project/quantik-core/) — the same
 project's Python implementation. Both keep the same core model (a tiny
