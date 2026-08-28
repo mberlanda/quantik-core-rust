@@ -23,12 +23,12 @@ use std::path::Path;
 #[cfg(feature = "arrow-parquet")]
 use std::sync::Arc;
 
-pub const CONTRACT_VERSION: &str = "1.1.0";
-pub const MODEL_CHECKPOINT_CONTRACT_VERSION: &str = "1.1.0";
-pub const SELFPLAY_CONTRACT_VERSION: &str = "1.1.0";
-pub const OBSERVATION_CONTRACT_VERSION: &str = "1.1.0";
-pub const GAME_RESULT_CONTRACT_VERSION: &str = "1.1.0";
-pub const SEARCH_SUMMARY_CONTRACT_VERSION: &str = "1.1.0";
+pub const CONTRACT_VERSION: &str = "1.2.0";
+pub const MODEL_CHECKPOINT_CONTRACT_VERSION: &str = "1.2.0";
+pub const SELFPLAY_CONTRACT_VERSION: &str = "1.2.0";
+pub const OBSERVATION_CONTRACT_VERSION: &str = "1.2.0";
+pub const GAME_RESULT_CONTRACT_VERSION: &str = "1.2.0";
+pub const SEARCH_SUMMARY_CONTRACT_VERSION: &str = "1.2.0";
 pub const SELFPLAY_SCHEMA: &str = "selfplay.v1";
 pub const ARROW_PARQUET_SELFPLAY_SCHEMA: &str = "arrow-parquet-selfplay.v1";
 pub const OPENING_BOOK_SCHEMA: &str = "opening-book.v1";
@@ -2807,7 +2807,7 @@ mod tests {
     }
 
     #[test]
-    fn selfplay_row_builder_emits_release_1_1_0_contract_json() {
+    fn selfplay_row_builder_emits_release_1_2_0_contract_json() {
         let row = selfplay_v1_row(
             7,
             0,
@@ -3542,7 +3542,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(manifest.schema, MODEL_CHECKPOINT_SCHEMA);
-        assert_eq!(manifest.contract_version, "1.1.0");
+        assert_eq!(manifest.contract_version, "1.2.0");
         assert_eq!(manifest.weights_format, "safetensors");
     }
 }
