@@ -93,7 +93,9 @@ fn root_line(qfen: &str) -> Result<String, String> {
     }
     if has_winning_line(&state.bb) || generate_legal_moves(&state.bb).is_empty() {
         // Terminal: the side to move has already lost.
-        return Ok(format!("{{\"qfen\":\"{qfen}\",\"score\":{TERMINAL},\"won\":false}}"));
+        return Ok(format!(
+            "{{\"qfen\":\"{qfen}\",\"score\":{TERMINAL},\"won\":false}}"
+        ));
     }
     let score = solve_score(&state);
     Ok(format!(
