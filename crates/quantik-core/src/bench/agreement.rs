@@ -364,16 +364,26 @@ mod tests {
         });
         let adapters_1: Vec<Box<dyn EngineAdapter>> = vec![
             Box::new(RandomAdapter),
+            // No time limit: a wall-clock budget makes the reached depth
+            // depend on machine load, so workers=1 and workers=2 could
+            // legitimately search to different depths and report different
+            // `nodes`. This test is about deterministic ordering and move
+            // choice, so the search must be budget-free to be comparable.
             Box::new(MinimaxAdapter {
                 max_depth: 2,
-                time_limit_s: Some(0.05),
+                time_limit_s: None,
             }),
         ];
         let adapters_2: Vec<Box<dyn EngineAdapter>> = vec![
             Box::new(RandomAdapter),
+            // No time limit: a wall-clock budget makes the reached depth
+            // depend on machine load, so workers=1 and workers=2 could
+            // legitimately search to different depths and report different
+            // `nodes`. This test is about deterministic ordering and move
+            // choice, so the search must be budget-free to be comparable.
             Box::new(MinimaxAdapter {
                 max_depth: 2,
-                time_limit_s: Some(0.05),
+                time_limit_s: None,
             }),
         ];
         let seeds = [0u64, 1u64];
