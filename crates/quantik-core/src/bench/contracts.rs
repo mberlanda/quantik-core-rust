@@ -1091,6 +1091,7 @@ pub fn parse_game_result_row(value: &Value) -> Result<GameResultRow, String> {
     })
 }
 
+#[cfg(feature = "arrow-parquet")]
 fn observation_record_from_row(row: &ObservationRow) -> Result<Value, String> {
     let record = json!({
         "schema": OBSERVATION_SCHEMA,
@@ -1115,6 +1116,7 @@ fn observation_record_from_row(row: &ObservationRow) -> Result<Value, String> {
     Ok(record)
 }
 
+#[cfg(feature = "arrow-parquet")]
 fn game_result_record_from_row(row: &GameResultRow) -> Result<Value, String> {
     let record = json!({
         "schema": GAME_RESULT_SCHEMA,
