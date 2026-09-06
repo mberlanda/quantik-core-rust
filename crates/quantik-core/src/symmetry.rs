@@ -57,6 +57,10 @@ const fn generate_shape_perms() -> [[u8; 4]; 24] {
     perms
 }
 
+/// Inverse of each D4 index: rotate90 <-> rotate270, every other element
+/// (identity, rotate180, and all four reflections) is its own inverse.
+const D4_INVERSE: [u8; 8] = [0, 3, 2, 1, 4, 5, 6, 7];
+
 /// Pre-computed LUT: `PERM16_LUT[d4_idx][mask]` → permuted mask.
 ///
 /// Built once on first access (~1 MB).  We use `Vec` instead of a fixed
@@ -163,6 +167,74 @@ impl SymmetryHandler {
         }
         seen.len()
     }
+
+    /// Remap an `action-index.v1` value (`shape * 16 + position`) under one
+    /// of the 192 canonicalization transforms.
+    ///
+    /// `transform_index` encodes `(d4_index, shape_perm)` as
+    /// `d4_index * 24 + shape_perm_index`, where `shape_perm_index` indexes
+    /// `SHAPE_PERMS` (lexicographic order of the 24 permutations of
+    /// `(0, 1, 2, 3)`, matching `quantik-core-py`'s independently-generated
+    /// `itertools.permutations` table). This is the same 192-element group
+    /// `find_canonical`/`orbit_size` search over -- color swap is not part
+    /// of it. See `docs/symmetry-transposition.md` in
+    /// quantik-core-contracts for the normative definition and
+    /// `fixtures/symmetry/symmetry-v1.json` for golden cases.
+    ///
+    /// Panics if `action_index >= 64` or `transform_index >= 192`.
+    pub fn remap_action_index(action_index: u8, transform_index: u8) -> u8 {
+        assert!(
+            action_index < 64,
+            "action_index must be 0..63, got {action_index}"
+        );
+        assert!(
+            transform_index < 192,
+            "transform_index must be 0..191, got {transform_index}"
+        );
+
+        let shape = action_index / 16;
+        let position = action_index % 16;
+        let d4_idx = (transform_index / 24) as usize;
+        let perm = &SHAPE_PERMS[(transform_index % 24) as usize];
+
+        let new_position = D4_MAPS[d4_idx][position as usize];
+        // Inverse lookup, not perm[shape]: perm[k] names which *original*
+        // shape moves into output slot k (see find_canonical above), so the
+        // slot receiving old shape `shape` is perm.position(shape).
+        let new_shape = perm
+            .iter()
+            .position(|&s| s == shape)
+            .expect("SHAPE_PERMS entries are permutations of 0..3") as u8;
+        new_shape * 16 + new_position
+    }
+
+    /// Returns the `transform_index` of the inverse transform.
+    ///
+    /// `remap_action_index(remap_action_index(a, t), inverse_transform_index(t)) == a`
+    /// for every action index `a` and transform index `t`.
+    ///
+    /// Panics if `transform_index >= 192`.
+    pub fn inverse_transform_index(transform_index: u8) -> u8 {
+        assert!(
+            transform_index < 192,
+            "transform_index must be 0..191, got {transform_index}"
+        );
+
+        let d4_idx = (transform_index / 24) as usize;
+        let perm = &SHAPE_PERMS[(transform_index % 24) as usize];
+
+        let mut inverse_perm = [0u8; 4];
+        for (i, &j) in perm.iter().enumerate() {
+            inverse_perm[j as usize] = i as u8;
+        }
+        let inverse_perm_index = SHAPE_PERMS
+            .iter()
+            .position(|p| *p == inverse_perm)
+            .expect("inverse of a permutation of 0..3 is itself one")
+            as u8;
+
+        D4_INVERSE[d4_idx] * 24 + inverse_perm_index
+    }
 }
 
 /// Compare two `[u16; 8]` in little-endian byte order.
@@ -238,6 +310,135 @@ mod tests {
             sorted.sort();
             let expected: Vec<u8> = (0..16).collect();
             assert_eq!(sorted, expected);
+        }
+    }
+
+    fn apply_transform_to_bitboard(bb: &Bitboard, d4_idx: usize, perm: &[u8; 4]) -> Bitboard {
+        let g0: [u16; 4] = std::array::from_fn(|s| permute16(bb.planes[s], d4_idx));
+        let g1: [u16; 4] = std::array::from_fn(|s| permute16(bb.planes[s + 4], d4_idx));
+        Bitboard::new([
+            g0[perm[0] as usize],
+            g0[perm[1] as usize],
+            g0[perm[2] as usize],
+            g0[perm[3] as usize],
+            g1[perm[0] as usize],
+            g1[perm[1] as usize],
+            g1[perm[2] as usize],
+            g1[perm[3] as usize],
+        ])
+    }
+
+    #[test]
+    fn identity_transform_is_a_no_op() {
+        for action_index in 0..64u8 {
+            assert_eq!(
+                SymmetryHandler::remap_action_index(action_index, 0),
+                action_index
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "action_index must be 0..63")]
+    fn remap_action_index_rejects_out_of_range_action_index() {
+        SymmetryHandler::remap_action_index(64, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "transform_index must be 0..191")]
+    fn remap_action_index_rejects_out_of_range_transform_index() {
+        SymmetryHandler::remap_action_index(0, 192);
+    }
+
+    #[test]
+    fn round_trip_every_transform_and_action() {
+        for transform_index in 0u8..192 {
+            let inverse = SymmetryHandler::inverse_transform_index(transform_index);
+            for action_index in 0u8..64 {
+                let transformed =
+                    SymmetryHandler::remap_action_index(action_index, transform_index);
+                assert!(transformed < 64);
+                let restored = SymmetryHandler::remap_action_index(transformed, inverse);
+                assert_eq!(restored, action_index, "transform_index={transform_index}");
+            }
+        }
+    }
+
+    #[test]
+    fn inverse_of_inverse_is_identity_transform() {
+        for transform_index in 0u8..192 {
+            let inverse = SymmetryHandler::inverse_transform_index(transform_index);
+            assert_eq!(
+                SymmetryHandler::inverse_transform_index(inverse),
+                transform_index
+            );
+        }
+    }
+
+    #[test]
+    fn remap_matches_direct_bitboard_transform() {
+        // Cross-check remap_action_index (pure index arithmetic) against
+        // actually transforming a single-piece bitboard the way
+        // find_canonical does, for every one of the 192 transforms.
+        let shape = 2u8;
+        let position = 5u8;
+        let action_index = shape * 16 + position;
+        let bb = Bitboard::EMPTY.with_move(0, shape, position);
+
+        for d4_idx in 0..8 {
+            for (perm_idx, perm) in SHAPE_PERMS.iter().enumerate() {
+                let transform_index = (d4_idx * 24 + perm_idx) as u8;
+                let transformed_bb = apply_transform_to_bitboard(&bb, d4_idx, perm);
+
+                let mut found = None;
+                for (new_shape, plane) in transformed_bb.planes[0..4].iter().enumerate() {
+                    if *plane != 0 {
+                        found = Some((new_shape as u8, plane.trailing_zeros() as u8));
+                    }
+                }
+                let (expected_shape, expected_position) =
+                    found.expect("exactly one piece must remain after a symmetry transform");
+                let expected_action_index = expected_shape * 16 + expected_position;
+
+                assert_eq!(
+                    SymmetryHandler::remap_action_index(action_index, transform_index),
+                    expected_action_index,
+                    "d4_idx={d4_idx} perm_idx={perm_idx}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn golden_cases_from_contracts_fixture() {
+        // Mirrors fixtures/symmetry/symmetry-v1.json's action_remap_cases in
+        // quantik-core-contracts, which were generated from and cross-checked
+        // against quantik-core-py. Kept here, rather than read from a sibling
+        // checkout, so this crate's tests stay hermetic; a future change to
+        // remap_action_index/inverse_transform_index must deliberately update
+        // both this list and the shared fixture, not silently drift from it.
+        let golden: [(u8, u8, u8, u8); 10] = [
+            // (action_index, transform_index, expected_action_index, inverse_transform_index)
+            (37, 0, 37, 0),     // identity
+            (37, 24, 38, 72),   // rot90
+            (37, 48, 42, 48),   // rot180
+            (37, 72, 41, 24),   // rot270
+            (37, 96, 38, 96),   // reflV
+            (37, 120, 41, 120), // reflH
+            (37, 144, 37, 144), // reflD
+            (37, 168, 42, 168), // reflAD
+            (37, 1, 53, 1),     // pure shape relabel (shapes 2<->3)
+            (37, 25, 54, 73),   // rot90 + shape relabel
+        ];
+        for (action_index, transform_index, expected, expected_inverse) in golden {
+            assert_eq!(
+                SymmetryHandler::remap_action_index(action_index, transform_index),
+                expected
+            );
+            assert_eq!(
+                SymmetryHandler::inverse_transform_index(transform_index),
+                expected_inverse
+            );
         }
     }
 }

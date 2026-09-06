@@ -7,7 +7,6 @@
 use crate::bench::canonical::canonical_json;
 use crate::bench::reference::parse_move_key;
 use crate::bitboard::Bitboard;
-use crate::constants::{MAX_PIECES_PER_SHAPE, WIN_MASKS};
 use crate::game::current_player;
 use crate::moves::generate_legal_moves;
 use crate::search_telemetry::SearchTelemetry;
@@ -1964,28 +1963,7 @@ fn observation_policy_visits_u32(policy_visits: &[u64]) -> Result<Vec<u32>, Stri
 }
 
 fn validate_bitboard_state(bitboards: &Bitboard) -> Result<u8, String> {
-    let mut occupied = 0u16;
-    for (index, plane) in bitboards.planes.iter().enumerate() {
-        if plane.count_ones() > MAX_PIECES_PER_SHAPE as u32 {
-            return Err(format!("bitboards[{index}] exceeds max pieces per shape"));
-        }
-        if occupied & plane != 0 {
-            return Err("bitboards contain overlapping pieces".to_string());
-        }
-        occupied |= plane;
-    }
-
-    for shape in 0..4 {
-        let p0 = bitboards.planes[shape];
-        let p1 = bitboards.planes[shape + 4];
-        for &line in &WIN_MASKS {
-            if (p0 & line != 0) && (p1 & line != 0) {
-                return Err("bitboards contain illegal same-shape line conflict".to_string());
-            }
-        }
-    }
-
-    current_player(bitboards).ok_or_else(|| "side_to_move does not match bitboards".to_string())
+    crate::validation::validate_bitboard_state(bitboards).map_err(|reason| reason.to_string())
 }
 
 pub fn action_index(shape: u8, position: u8) -> u8 {

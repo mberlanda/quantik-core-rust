@@ -1,9 +1,10 @@
 use crate::bitboard::Bitboard;
 use crate::constants::MAX_PIECES_PER_SHAPE;
-use crate::game::{check_winner, current_player, WinStatus};
+use crate::game::{check_winner, WinStatus};
 use crate::moves::{apply_move, generate_legal_moves, is_move_legal, Move};
 use crate::qfen::{bb_from_qfen, bb_to_qfen};
 use crate::state::State;
+use crate::validation::validate_bitboard_state;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GameResult {
@@ -68,17 +69,14 @@ impl QuantikBoard {
     }
 
     pub fn from_bitboard(bb: Bitboard) -> Result<Self, String> {
-        let cp = current_player(&bb).ok_or("Invalid turn balance")?;
+        // Full validation (overlap, inventory, turn balance, same-shape line
+        // conflicts) at the constructor boundary -- see
+        // quantik-core-contracts docs/game-state.md#invalid-state-validation-boundaries.
+        let cp = validate_bitboard_state(&bb).map_err(|reason| reason.to_string())?;
         let mut invs = [PlayerInventory::full(), PlayerInventory::full()];
         for player in 0..2u8 {
             for shape in 0..4u8 {
                 let used = bb.shape_piece_count(player, shape) as u8;
-                if used > MAX_PIECES_PER_SHAPE {
-                    return Err(format!(
-                        "Player {} has {} pieces of shape {} (max {})",
-                        player, used, shape, MAX_PIECES_PER_SHAPE
-                    ));
-                }
                 invs[player as usize].remaining[shape as usize] = MAX_PIECES_PER_SHAPE - used;
             }
         }
@@ -297,5 +295,37 @@ mod tests {
         board.play_move(Move::new(0, 2, 2)).unwrap(); // C at 2
         board.play_move(Move::new(1, 3, 3)).unwrap(); // d at 3
         assert!(board.is_game_over());
+    }
+
+    // Constructor-boundary invalid-state rejections. Mirrors
+    // quantik-core-contracts' fixtures/invalid-states/invalid-state-v1.json
+    // (see docs/game-state.md#invalid-state-validation-boundaries): the
+    // constructor must reject every one of these, not just turn-balance and
+    // inventory as it did before QW-001.
+
+    #[test]
+    fn from_qfen_rejects_turn_balance_invalid() {
+        // Two player-0 pieces, zero player-1 pieces: difference of 2.
+        assert!(QuantikBoard::from_qfen("AB../..../..../....").is_err());
+    }
+
+    #[test]
+    fn from_qfen_rejects_shape_count_exceeded() {
+        // Player 0 has three shape-A pieces; inventory allows at most 2.
+        assert!(QuantikBoard::from_qfen("A.../A.../A.../....").is_err());
+    }
+
+    #[test]
+    fn from_qfen_rejects_illegal_placement_cross_player_same_shape_line() {
+        // Player 0 and player 1 both place shape A in row 0.
+        assert!(QuantikBoard::from_qfen("Aa../..../..../....").is_err());
+    }
+
+    #[test]
+    fn from_bitboard_rejects_piece_overlap() {
+        // Player 0 shape A and shape B both occupy position 0; not
+        // expressible as QFEN (one character per cell).
+        let bb = Bitboard::new([1, 1, 0, 0, 0, 0, 0, 0]);
+        assert!(QuantikBoard::from_bitboard(bb).is_err());
     }
 }
