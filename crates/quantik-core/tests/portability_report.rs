@@ -198,6 +198,42 @@ fn build_report_rejects_empty_case_fixture() {
 }
 
 #[test]
+fn build_report_rejects_illegal_placement_state() {
+    // QW-001 regression: before the adapter/portability-report boundary was
+    // brought to parity with the constructor boundary, this case passed --
+    // turn balance is 1-1 (balanced), so the old turn-balance-only check
+    // accepted it, even though player 0 and player 1 both place shape A in
+    // row 0 (ILLEGAL_PLACEMENT). See
+    // quantik-core-contracts docs/game-state.md#invalid-state-validation-boundaries
+    // and fixtures/invalid-states/invalid-state-v1.json.
+    let contracts_root = test_contracts_root("illegal-placement");
+    fs::write(
+        contracts_root.join("fixtures/api-portability/game-state-v1.json"),
+        r#"{
+  "schema": "api-portability-fixtures.v1",
+  "contract_version": "1.2.0",
+  "game_state_cases": [
+    {
+      "case_id": "illegal-placement-cross-player-same-shape-line",
+      "qfen": "Aa../..../..../....",
+      "move": {"shape": 1, "position": 4}
+    }
+  ]
+}
+"#,
+    )
+    .expect("api portability fixture should be overwritten");
+
+    let error = build_report(&contracts_root).expect_err("illegal placement should be rejected");
+    assert!(
+        error.contains("illegal same-shape line conflict"),
+        "unexpected error: {error}"
+    );
+
+    let _ = fs::remove_dir_all(contracts_root);
+}
+
+#[test]
 fn cli_writes_report_to_requested_output() {
     let contracts_root = test_contracts_root("cli");
     let output_path = temp_report_path();

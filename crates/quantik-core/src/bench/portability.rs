@@ -1,8 +1,9 @@
 use crate::bench::contracts::{action_index, canonical_key_hex};
-use crate::game::{check_winner, current_player, WinStatus};
+use crate::game::{check_winner, WinStatus};
 use crate::moves::{apply_move, generate_legal_moves, Move};
 use crate::state::State;
 use crate::symmetry::SymmetryHandler;
+use crate::validation::validate_bitboard_state;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -169,8 +170,12 @@ fn project_case(case: &GameStateCase) -> Result<Value, String> {
         .map_err(|e| format!("case {} qfen parse failed: {e}", case.case_id))?;
     let qfen = state.to_qfen();
     let canonical = State::new(SymmetryHandler::find_canonical(&state.bb));
-    let side_to_move = current_player(&state.bb)
-        .ok_or_else(|| format!("case {} has invalid side-to-move parity", case.case_id))?;
+    // Full validation at the adapter/portability-report boundary -- not just
+    // turn-balance parity -- so this report can never accept a state the
+    // constructor boundary (QuantikBoard::from_bitboard) would reject. See
+    // quantik-core-contracts docs/game-state.md#invalid-state-validation-boundaries.
+    let side_to_move = validate_bitboard_state(&state.bb)
+        .map_err(|reason| format!("case {} is an invalid game state: {reason}", case.case_id))?;
     let legal_moves = generate_legal_moves(&state.bb);
     let winner = check_winner(&state.bb);
     let terminal = winner != WinStatus::NoWin || legal_moves.is_empty();
