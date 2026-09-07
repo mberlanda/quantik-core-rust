@@ -4,6 +4,24 @@ All notable changes to `quantik-core` are documented here.
 
 ## Unreleased
 
+## 1.3.0 - 2026-09-07
+
+### Added
+
+- `remap_action_index` / `inverse_transform_index`, completing the
+  action-index side of the canonical state/action encoding contract
+  (QW-001). Bitboard-side canonicalization (D4 x shape permutation, 192
+  elements) and invalid-state validation boundaries were brought to parity
+  with `quantik-core-py` in the same initiative.
+
+### Changed
+
+- Bumped the crate version and all `*_CONTRACT_VERSION` constants to
+  `1.3.0`, tracking the contracts `1.3.0` release (symmetry and
+  invalid-state fixtures) and its `1.3.1` follow-up patch (opening-book
+  consistency drift-check fix -- see
+  https://mauroberlanda.substack.com/p/the-deadlock-i-wrote-myself-when).
+
 ## 1.2.0 - 2026-07-18
 
 ### Added
