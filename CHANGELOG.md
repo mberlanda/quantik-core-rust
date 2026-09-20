@@ -18,8 +18,8 @@ All notable changes to `quantik-core` are documented here.
 
 - Bumped the crate version and all `*_CONTRACT_VERSION` constants to
   `1.3.0`, tracking the contracts `1.3.0` release (symmetry and
-  invalid-state fixtures) and its `1.3.1` follow-up patch (opening-book
-  consistency drift-check fix -- see
+  invalid-state fixtures, plus the opening-book consistency drift-check
+  fix folded into the same release -- see
   https://mauroberlanda.substack.com/p/the-deadlock-i-wrote-myself-when).
 
 ## 1.2.0 - 2026-07-18

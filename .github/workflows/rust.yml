@@ -97,7 +97,7 @@ jobs:
         # same opening-book graph?); version alignment is verified against
         # published PyPI/crates.io artifacts by a separate nightly job in
         # quantik-core-contracts instead.
-        uses: mberlanda/quantik-core-contracts/actions/opening-book-consistency@v1.3.1
+        uses: mberlanda/quantik-core-contracts/actions/opening-book-consistency@v1.3.0
         with:
           rust-command: |
             mkdir -p quantik-core-rust/target/opening-book-consistency
