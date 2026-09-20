@@ -342,7 +342,7 @@ impl ProbeFile {
         let body = &data[body_start..];
 
         // Records: corrupt-field checks.
-        for (index, rec) in body.chunks_exact(RECORD_SIZE).enumerate() {
+        for (index, rec) in body.as_chunks::<RECORD_SIZE>().0.iter().enumerate() {
             Self::check_record(index, rec)?;
         }
         let sha = Sha256::digest(body);
@@ -354,7 +354,7 @@ impl ProbeFile {
         // Strictly ascending, bytewise (slice comparison is lexicographic).
         let mut counts: BTreeMap<u32, u64> = BTreeMap::new();
         let mut prev: Option<&[u8]> = None;
-        for rec in body.chunks_exact(RECORD_SIZE) {
+        for rec in body.as_chunks::<RECORD_SIZE>().0 {
             let key = &rec[..KEY_SIZE];
             if let Some(p) = prev {
                 if p >= key {
