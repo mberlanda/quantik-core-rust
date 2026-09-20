@@ -712,3 +712,503 @@ fn error_kinds_are_the_section_5_names() {
     assert_eq!(e.kind(), "checksum mismatch");
     assert!(e.to_string().contains("checksum"));
 }
+
+// ── W4: cross-produced evidence from a real book ────────────────────
+//
+// Source: the 22 exactly-solved references in the repository's golden dataset
+// (`benchmarks/positions-v1.json`, produced by `MinimaxEngine`, not by the
+// probe code). They are written into a real `OpeningBookDatabase` in the
+// representative's frame, projected by the real `probe_builder` binary, and
+// then queried. The truth the probe is checked against is the solver's own
+// `optimal_moves` in each position's ORIGINAL orientation, and an
+// independently written symmetry transform (below), not `SymmetryHandler`.
+//
+// This runs in the default suite (well under a second in debug), so it is a
+// test rather than a docs-only transcript. Run with `--nocapture` to print the
+// transcript.
+
+/// Independent symmetry: D4 element `d` on a board position (row-major 0..16).
+fn d4(d: usize, pos: u8) -> u8 {
+    let (mut r, mut c) = (pos / 4, pos % 4);
+    // d = 4*reflect + rotations (quarter turns).
+    for _ in 0..d % 4 {
+        (r, c) = (c, 3 - r);
+    }
+    if d >= 4 {
+        c = 3 - c;
+    }
+    r * 4 + c
+}
+
+const PERMS: [[u8; 4]; 24] = {
+    let mut out = [[0u8; 4]; 24];
+    let mut n = 0;
+    let mut a = 0u8;
+    while a < 4 {
+        let mut b = 0u8;
+        while b < 4 {
+            let mut c = 0u8;
+            while c < 4 {
+                let mut e = 0u8;
+                while e < 4 {
+                    if a != b && a != c && a != e && b != c && b != e && c != e {
+                        out[n] = [a, b, c, e];
+                        n += 1;
+                    }
+                    e += 1;
+                }
+                c += 1;
+            }
+            b += 1;
+        }
+        a += 1;
+    }
+    out
+};
+
+/// Shape `s` becomes `perm[s]`, cell `p` becomes `d4(d, p)`; players untouched.
+fn image(b: &Bitboard, d: usize, perm: &[u8; 4]) -> Bitboard {
+    let mut planes = [0u16; 8];
+    for player in 0..2 {
+        for s in 0..4 {
+            for p in 0..16u8 {
+                if b.planes[player * 4 + s] >> p & 1 == 1 {
+                    planes[player * 4 + perm[s] as usize] |= 1 << d4(d, p);
+                }
+            }
+        }
+    }
+    Bitboard::new(planes)
+}
+
+fn image_action(a: u8, d: usize, perm: &[u8; 4]) -> u8 {
+    perm[(a / 16) as usize] * 16 + d4(d, a % 16)
+}
+
+fn side_to_move(b: &Bitboard) -> u8 {
+    ((b.player_piece_count(0) + b.player_piece_count(1)) % 2) as u8
+}
+
+fn children_classes(b: &Bitboard, actions: &[u8]) -> std::collections::BTreeSet<[u8; 16]> {
+    let side = side_to_move(b);
+    actions
+        .iter()
+        .map(|&a| {
+            let child = quantik_core::moves::apply_move(
+                b,
+                &quantik_core::moves::Move::new(side, a / 16, a % 16),
+            );
+            SymmetryHandler::canonical_payload(&child)
+        })
+        .collect()
+}
+
+struct Solved {
+    id: String,
+    qfen: String,
+    value: i8,
+    actions: Vec<u8>, // solver truth, caller's (original) orientation, ascending
+}
+
+fn solved_references() -> Vec<Solved> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/positions-v1.json");
+    let payload: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    payload["positions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| !p["reference"].is_null())
+        .map(|p| {
+            let mut actions: Vec<u8> = p["reference"]["optimal_moves"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| {
+                    let parts: Vec<u8> = m
+                        .as_str()
+                        .unwrap()
+                        .split(':')
+                        .map(|x| x.parse().unwrap())
+                        .collect();
+                    parts[1] * 16 + parts[2]
+                })
+                .collect();
+            actions.sort_unstable();
+            Solved {
+                id: p["id"].as_str().unwrap().into(),
+                qfen: p["qfen"].as_str().unwrap().into(),
+                value: p["reference"]["value"].as_i64().unwrap() as i8,
+                actions,
+            }
+        })
+        .collect()
+}
+
+/// Rebuild `bytes` with `edit` applied to the record body and a recomputed
+/// checksum, so the file is well-formed except for the edit.
+fn reseal(bytes: &[u8], edit: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+    let len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let mut header: Value = serde_json::from_slice(&bytes[12..12 + len]).unwrap();
+    let start = (12 + len).div_ceil(8) * 8;
+    let mut body = bytes[start..].to_vec();
+    edit(&mut body);
+    header["body_sha256"] = hex(&Sha256::digest(&body)).into();
+    encode_file(&header, &body)
+}
+
+#[test]
+fn evidence_from_a_real_book() {
+    let refs = solved_references();
+    assert_eq!(
+        refs.len(),
+        22,
+        "golden dataset carries 22 solved references"
+    );
+    let mut log: Vec<String> = Vec::new();
+
+    // ── build: real book -> real probe_builder ──────────────────────
+    let dir = std::env::temp_dir().join(format!("qw004-w4-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (db_path, out_path) = (dir.join("book.db"), dir.join("book.probe"));
+    let _ = std::fs::remove_file(&db_path);
+    let mut stored_actions_by_rep: std::collections::BTreeMap<[u8; 16], Vec<u8>> =
+        Default::default();
+    {
+        let db = OpeningBookDatabase::open(&OpeningBookConfig {
+            database_path: db_path.to_string_lossy().into(),
+            cache_size_mb: 1,
+            enable_wal: false,
+        })
+        .unwrap();
+        for r in &refs {
+            let orig = bb(&r.qfen);
+            let (rep, t) = SymmetryHandler::find_canonical_with_transform(&orig);
+            let stored: Vec<u8> = r
+                .actions
+                .iter()
+                .map(|&a| SymmetryHandler::remap_action_index(a, t))
+                .collect();
+            // The book row is in the representative's frame: legal there, and
+            // it reaches the same child classes as the solver's moves did.
+            let side = side_to_move(&rep);
+            assert!(stored
+                .iter()
+                .all(|&a| is_move_legal(&rep, side, a / 16, a % 16)));
+            assert_eq!(
+                children_classes(&orig, &r.actions),
+                children_classes(&rep, &stored)
+            );
+            let pairs: Vec<(i32, i32)> = stored
+                .iter()
+                .map(|&a| ((a / 16) as i32, (a % 16) as i32))
+                .collect();
+            let rep_state = State::new(rep);
+            assert!(db
+                .add_solved_position(&rep_state, r.value as i32, &pairs)
+                .unwrap());
+            stored_actions_by_rep.insert(rep.to_le_bytes(), stored);
+        }
+    }
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_probe_builder"))
+        .args([
+            "--book",
+            db_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("probe_builder runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let real_bytes = std::fs::read(&out_path).unwrap();
+    let file = ProbeFile::open(&out_path).unwrap();
+    let h = file.header();
+    log.push(format!(
+        "SOURCE  {} solver references (positions-v1.json) -> OpeningBookDatabase -> probe_builder",
+        refs.len()
+    ));
+    log.push(format!(
+        "        {} bytes, entry_count={}, ply {}..={}, per_ply={:?}, book_id={}, coverage_complete={:?}",
+        real_bytes.len(), h.entry_count, h.ply_min, h.ply_max, h.per_ply, h.book_id, h.coverage_complete
+    ));
+    assert_eq!(file.len(), stored_actions_by_rep.len());
+    let non_reps = refs
+        .iter()
+        .filter(|r| SymmetryHandler::find_canonical(&bb(&r.qfen)) != bb(&r.qfen))
+        .count();
+    log.push(format!(
+        "        {non_reps} of {} solved positions are NOT their own representative (transform != identity)",
+        refs.len()
+    ));
+    assert!(non_reps >= 20);
+
+    // ── case 1: hits, in the caller's orientation, against solver truth ──
+    let mut hit_lines = Vec::new();
+    for r in &refs {
+        match file.probe_detailed(&bb(&r.qfen)).unwrap() {
+            ProbeLookup::Hit(hit) => {
+                assert_eq!(
+                    (hit.game_value, hit.status),
+                    (r.value, ProbeStatus::Exact),
+                    "{}",
+                    r.id
+                );
+                assert_eq!(
+                    hit.actions, r.actions,
+                    "{}: returned != solver optimal_moves",
+                    r.id
+                );
+                hit_lines.push(format!(
+                    "        {} {} t*={:>3} value={} actions={:?} == solver",
+                    r.id, r.qfen, hit.transform_index, hit.game_value, hit.actions
+                ));
+            }
+            other => panic!("{}: expected a hit, got {other:?}", r.id),
+        }
+    }
+    log.push(format!(
+        "HITS    {}/{} solver positions hit, returned actions equal the solver's",
+        refs.len(),
+        refs.len()
+    ));
+    log.extend(hit_lines);
+
+    // ── case 5 (run before misses so the counts print together): transformed
+    // moves. Every distinct image of every solved position under an
+    // independently implemented 192-element group is a caller.
+    let (mut callers, mut actions_checked, mut identity_t) = (0usize, 0usize, 0usize);
+    for r in &refs {
+        let orig = bb(&r.qfen);
+        let mut seen = std::collections::BTreeSet::new();
+        for d in 0..8 {
+            for perm in &PERMS {
+                let img = image(&orig, d, perm);
+                if !seen.insert(img.planes) {
+                    continue; // stabiliser: same caller already checked
+                }
+                let side = side_to_move(&img);
+                let want: Vec<u8> = {
+                    let mut w: Vec<u8> = r
+                        .actions
+                        .iter()
+                        .map(|&a| image_action(a, d, perm))
+                        .collect();
+                    w.sort_unstable();
+                    w
+                };
+                let hit = match file.probe_detailed(&img).unwrap() {
+                    ProbeLookup::Hit(h) => h,
+                    other => panic!("{} image ({d},{perm:?}): {other:?}", r.id),
+                };
+                callers += 1;
+                identity_t += (hit.transform_index == 0) as usize;
+                for &a in &hit.actions {
+                    // The defect being hunted: legal in the representative's
+                    // frame only. Legality is asked of the CALLER's board.
+                    assert!(
+                        is_move_legal(&img, side, a / 16, a % 16),
+                        "{} illegal {a}",
+                        r.id
+                    );
+                    actions_checked += 1;
+                }
+                assert_eq!(hit.actions, want, "{} image ({d},{perm:?})", r.id);
+                assert_eq!(
+                    children_classes(&img, &hit.actions),
+                    children_classes(&orig, &r.actions),
+                    "{} image ({d},{perm:?}): children left the solver's classes",
+                    r.id
+                );
+            }
+        }
+    }
+    let (mut wrong_frame, mut wrong_total) = (0usize, 0usize);
+    // Sensitivity: how many of those returned actions would have been ILLEGAL
+    // had the stored (representative-frame) actions been returned as-is.
+    for r in &refs {
+        let orig = bb(&r.qfen);
+        let (rep, _) = SymmetryHandler::find_canonical_with_transform(&orig);
+        let stored = &stored_actions_by_rep[&rep.to_le_bytes()];
+        let mut seen = std::collections::BTreeSet::new();
+        for d in 0..8 {
+            for perm in &PERMS {
+                let img = image(&orig, d, perm);
+                if !seen.insert(img.planes) {
+                    continue;
+                }
+                let side = side_to_move(&img);
+                for &a in stored {
+                    wrong_total += 1;
+                    wrong_frame += !is_move_legal(&img, side, a / 16, a % 16) as usize;
+                }
+            }
+        }
+    }
+    assert!(wrong_frame > 0, "the legality check must be able to fail");
+    let transformed_lines = vec![
+        format!(
+            "TRANSFORMED  {callers} distinct callers (all images of the 22 positions under 8 D4 x 24 shape permutations), {identity_t} with t*=0"
+        ),
+        format!(
+            "        {actions_checked}/{actions_checked} returned actions legal on the CALLER's board (is_move_legal); 0 illegal"
+        ),
+        "        every returned set equals the solver's optimal_moves pushed through the independent transform; child classes equal".into(),
+        format!(
+            "        control: returning the stored representative-frame actions unmapped would be illegal for {wrong_frame} of {wrong_total} (caller, action) pairs"
+        ),
+    ];
+
+    // ── case 2: misses ──────────────────────────────────────────────
+    let mut miss_lines = Vec::new();
+    let payload: Value = serde_json::from_slice(
+        &std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/positions-v1.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut key_absent = 0;
+    for p in payload["positions"].as_array().unwrap() {
+        if !p["reference"].is_null() {
+            continue;
+        }
+        let q = p["qfen"].as_str().unwrap();
+        let b = bb(q);
+        let ply = b.player_piece_count(0) + b.player_piece_count(1);
+        let got = file.probe_detailed(&b).unwrap();
+        let want = if ply < h.ply_min || ply > h.ply_max {
+            MissReason::PlyOutsideCoverage
+        } else {
+            MissReason::KeyAbsent
+        };
+        assert_eq!(got, ProbeLookup::Miss(want), "{q}");
+        assert!(file.probe(&b).unwrap().is_none());
+        key_absent += (want == MissReason::KeyAbsent) as usize;
+        miss_lines.push(format!(
+            "        {} {q} ply={ply} -> Miss({want:?})",
+            p["id"].as_str().unwrap()
+        ));
+    }
+    let empty = Bitboard::EMPTY;
+    assert_eq!(
+        file.probe_detailed(&empty).unwrap(),
+        ProbeLookup::Miss(MissReason::PlyOutsideCoverage)
+    );
+    miss_lines.push("        empty board ply=0 -> Miss(PlyOutsideCoverage)".into());
+    assert!(key_absent > 0);
+    log.push(format!(
+        "MISSES  {} unsolved dataset positions plus the empty board; none returned a move ({key_absent} KeyAbsent, rest PlyOutsideCoverage)",
+        miss_lines.len() - 1
+    ));
+    log.extend(miss_lines);
+    log.extend(transformed_lines);
+
+    // ── case 3: corrupt data ────────────────────────────────────────
+    let mut corrupt_lines = Vec::new();
+    let mut expect = |name: &str, bytes: Vec<u8>, kind: &str| {
+        let err = ProbeFile::from_bytes(bytes).expect_err(name);
+        assert_eq!(err.kind(), kind, "{name}");
+        corrupt_lines.push(format!("        {name:<44} -> {} | {err}", err.kind()));
+    };
+    let mut b = real_bytes.clone();
+    *b.last_mut().unwrap() ^= 1;
+    expect(
+        "flip one bit in the last action mask",
+        b,
+        "checksum mismatch",
+    );
+    expect(
+        "drop the final byte",
+        real_bytes[..real_bytes.len() - 1].to_vec(),
+        "truncated",
+    );
+    let mut b = real_bytes.clone();
+    b[0] = b'X';
+    expect("bad magic", b, "corrupt");
+    expect(
+        "record status byte 9, checksum recomputed",
+        reseal(&real_bytes, |body| body[19] = 9),
+        "corrupt",
+    );
+    expect(
+        "extra record prepended, checksum recomputed",
+        reseal(&real_bytes, |body| {
+            let first = body[..28].to_vec();
+            body.splice(0..0, first);
+        }),
+        "truncated", // entry_count no longer matches the file length: caught by layout, before sortedness
+    );
+    // A stored action that is not legal for the caller, with a valid checksum:
+    // only the orientation tripwire can catch it, and it must be an error, not a move.
+    let victim = &refs[0];
+    let victim_bb = bb(&victim.qfen);
+    let rep_key = State::new(SymmetryHandler::find_canonical(&victim_bb)).canonical_key();
+    let poisoned = reseal(&real_bytes, |body| {
+        let at = body.chunks(28).position(|c| c[..18] == rep_key).unwrap() * 28;
+        // Replace the mask with every action of shape 0: some occupied cell on
+        // the caller's board is always among them.
+        body[at + 20..at + 28].copy_from_slice(&0xFFFFu64.to_le_bytes());
+    });
+    let pf = ProbeFile::from_bytes(poisoned).expect("well-formed by every static check");
+    let err = pf.probe(&victim_bb).expect_err("tripwire");
+    assert_eq!(err.kind(), "illegal mapped-back action");
+    corrupt_lines.push(format!(
+        "        {:<44} -> {} | {err}",
+        "legal-looking file, mask illegal for caller",
+        err.kind()
+    ));
+    log.push(
+        "CORRUPT ".to_string()
+            + &format!(
+                "{} mutations of the real probe, all fail fast (Err, never a move)",
+                corrupt_lines.len()
+            ),
+    );
+    log.extend(corrupt_lines);
+
+    // ── case 4: incompatible versions ───────────────────────────────
+    let mut incompat_lines = Vec::new();
+    let mut expect_inc = |name: &str, bytes: Vec<u8>| {
+        let err = ProbeFile::from_bytes(bytes).expect_err(name);
+        assert_eq!(err.kind(), "incompatible version", "{name}");
+        incompat_lines.push(format!("        {name:<44} -> {} | {err}", err.kind()));
+    };
+    let mut b = real_bytes.clone();
+    b[7] = 2;
+    expect_inc("magic format byte 2", b);
+    let with_header = |edit: &dyn Fn(&mut Value)| {
+        let len = u32::from_le_bytes(real_bytes[8..12].try_into().unwrap()) as usize;
+        let mut header: Value = serde_json::from_slice(&real_bytes[12..12 + len]).unwrap();
+        edit(&mut header);
+        let start = (12 + len).div_ceil(8) * 8;
+        encode_file(&header, &real_bytes[start..])
+    };
+    expect_inc(
+        "schema opening-probe.v2",
+        with_header(&|h| h["schema"] = "opening-probe.v2".into()),
+    );
+    expect_inc(
+        "format_major 2",
+        with_header(&|h| h["format_major"] = 2.into()),
+    );
+    expect_inc(
+        "key_format canonical_key.v2",
+        with_header(&|h| h["key_format"] = "canonical_key.v2".into()),
+    );
+    let stale =
+        ProbeFile::open_expecting_book_id(&out_path, "sha256:not-this-book").expect_err("stale");
+    assert_eq!(stale.kind(), "stale");
+    incompat_lines.push(format!(
+        "        {:<44} -> {} | {stale}",
+        "opt-in stale check, wrong book_id",
+        stale.kind()
+    ));
+    log.push(format!("INCOMPATIBLE  {} mutations, all rejected before any record is read (stale check is a separate kind)", incompat_lines.len()));
+    log.extend(incompat_lines);
+
+    println!("\n{}\n", log.join("\n"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
