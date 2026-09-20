@@ -9,6 +9,7 @@ pub mod mcts;
 pub mod minimax;
 pub mod moves;
 pub mod opening_book;
+pub mod opening_probe;
 pub mod qfen;
 pub mod search_telemetry;
 pub mod state;
