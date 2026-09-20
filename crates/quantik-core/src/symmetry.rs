@@ -108,13 +108,29 @@ impl SymmetryHandler {
     /// Find the canonical (lexicographically smallest) bitboard under the
     /// 192-element symmetry group (8 D4 × 24 shape permutations, no color swap).
     pub fn find_canonical(bb: &Bitboard) -> Bitboard {
+        Self::find_canonical_with_transform(bb).0
+    }
+
+    /// Like [`find_canonical`](Self::find_canonical), but also returns the
+    /// `transform_index` (`d4_index * 24 + shape_perm_index`) that maps `bb`
+    /// to the representative: `remap_action_index(a, t)` moves an action from
+    /// `bb`'s frame into the representative's frame, and
+    /// `remap_action_index(a, inverse_transform_index(t))` moves it back.
+    ///
+    /// When several transforms produce the same representative (a
+    /// non-trivial stabiliser), the **lowest** `transform_index` is returned.
+    /// The loop visits indices in ascending order and only replaces the best
+    /// candidate on a strictly-less payload, so ties keep the earliest. This is
+    /// a contract (`opening-probe.v1`, docs section 3.4), not an accident.
+    pub fn find_canonical_with_transform(bb: &Bitboard) -> (Bitboard, u8) {
         let mut best: Option<[u16; 8]> = None;
+        let mut best_transform = 0u8;
 
         for d4_idx in 0..8 {
             let g0: [u16; 4] = std::array::from_fn(|s| permute16(bb.planes[s], d4_idx));
             let g1: [u16; 4] = std::array::from_fn(|s| permute16(bb.planes[s + 4], d4_idx));
 
-            for perm in &SHAPE_PERMS {
+            for (perm_idx, perm) in SHAPE_PERMS.iter().enumerate() {
                 let candidate: [u16; 8] = [
                     g0[perm[0] as usize],
                     g0[perm[1] as usize],
@@ -132,10 +148,11 @@ impl SymmetryHandler {
                 };
                 if is_better {
                     best = Some(candidate);
+                    best_transform = (d4_idx * 24 + perm_idx) as u8;
                 }
             }
         }
-        Bitboard::new(best.unwrap_or([0; 8]))
+        (Bitboard::new(best.unwrap_or([0; 8])), best_transform)
     }
 
     /// 16-byte canonical payload (LE-packed planes of the canonical form).
