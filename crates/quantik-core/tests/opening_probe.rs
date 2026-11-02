@@ -43,7 +43,7 @@ fn meta(book_id: &str) -> ProbeBuildMeta {
         book_id: book_id.into(),
         generator: "test".into(),
         generator_version: "1".into(),
-        contract_version: "1.3.0".into(),
+        contract_version: "1.4.0".into(),
         created_at: None,
         coverage_complete: Some(true),
     }
