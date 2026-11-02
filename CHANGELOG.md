@@ -4,6 +4,29 @@ All notable changes to `quantik-core` are documented here.
 
 ## Unreleased
 
+## 1.4.0 - 2026-11-02
+
+### Added
+
+- `opening-probe.v1` reader, builder and orientation-safe lookup, so a probe
+  keyed on canonical representatives can be queried from any orientation of
+  a position (#44).
+- Cross-produced opening-probe evidence test, reading probes produced by the
+  other stack from the contracts fixtures (#45).
+
+### Changed
+
+- The `portability-report` binary now has default values for its arguments
+  (#43).
+- CI checks out the `quantik-core-contracts` fixtures (at the matching tag on
+  tag builds) and runs the tests with `QUANTIK_REQUIRE_FIXTURES=1`, so a
+  missing fixture fails instead of skipping (#46).
+- CI: bumped `actions/checkout`, cache and setup-python off Node 20, and
+  pinned the `opening-book-consistency` action to contracts `v1.4.0`.
+- Bumped the crate version and all `*_CONTRACT_VERSION` constants to
+  `1.4.0`, tracking the contracts `1.4.0` release. The tag build checks out
+  contracts and py at the same tag, so tag in order: contracts, py, rust.
+
 ## 1.3.0 - 2026-09-07
 
 ### Added
